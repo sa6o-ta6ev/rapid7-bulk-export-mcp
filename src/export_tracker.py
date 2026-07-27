@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from .db_utils import duckdb_connection
 
+DEFAULT_ORG_ID = "default"
+
 
 class ExportTracker:
     """Tracks export metadata in a separate DuckDB database."""
@@ -53,18 +55,37 @@ class ExportTracker:
                 # Column already exists, ignore
                 pass  # nosec B110
 
+            # Migrate schema: add organization_id column for existing databases
+            try:
+                conn.execute("""
+                    ALTER TABLE exports ADD COLUMN organization_id VARCHAR DEFAULT 'default'
+                """)
+            except Exception:
+                # Column already exists, ignore
+                pass  # nosec B110
+
             # Create index on export_date and export_type for fast lookups
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_export_date_type
                 ON exports(export_date, export_type)
             """)
 
-    def get_today_export(self, export_type: str = "vulnerability") -> Optional[Dict[str, Any]]:
+            # Create composite index including organization_id for multi-tenant lookups
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_export_date_type_org
+                ON exports(export_date, export_type, organization_id)
+            """)
+
+    def get_today_export(
+        self, export_type: str = "vulnerability", organization_id: str = DEFAULT_ORG_ID
+    ) -> Optional[Dict[str, Any]]:
         """
         Get the most recent completed export from today.
 
         Args:
             export_type: Type of export to filter by (default: 'vulnerability')
+            organization_id: Tenant scope to filter by (default: 'default',
+                the single-tenant/unscoped store)
 
         Returns:
             Dictionary with export metadata if found, None otherwise
@@ -83,15 +104,17 @@ class ExportTracker:
                     row_count,
                     parquet_urls,
                     local_files,
-                    export_type
+                    export_type,
+                    organization_id
                 FROM exports
                 WHERE export_date = ?
                   AND status = 'COMPLETE'
                   AND export_type = ?
+                  AND organization_id = ?
                 ORDER BY created_at DESC
                 LIMIT 1
             """,
-                [today, export_type],
+                [today, export_type, organization_id],
             ).fetchone()
 
         if result:
@@ -105,6 +128,7 @@ class ExportTracker:
                 "parquet_urls": result[6],
                 "local_files": result[7],
                 "export_type": result[8],
+                "organization_id": result[9],
             }
 
         return None
@@ -117,6 +141,7 @@ class ExportTracker:
         local_files: Optional[List[str]] = None,
         row_count: Optional[int] = None,
         export_type: str = "vulnerability",
+        organization_id: str = DEFAULT_ORG_ID,
     ):
         """
         Save or update export metadata.
@@ -128,6 +153,7 @@ class ExportTracker:
             local_files: List of local file paths (optional)
             row_count: Number of rows loaded (optional)
             export_type: Type of export (default: 'vulnerability')
+            organization_id: Tenant scope this export belongs to (default: 'default')
         """
         today = date.today()
         now = datetime.now()
@@ -144,15 +170,17 @@ class ExportTracker:
                     row_count,
                     parquet_urls,
                     local_files,
-                    export_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    export_type,
+                    organization_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (export_id) DO UPDATE SET
                     status = EXCLUDED.status,
                     file_count = EXCLUDED.file_count,
                     row_count = EXCLUDED.row_count,
                     parquet_urls = EXCLUDED.parquet_urls,
                     local_files = EXCLUDED.local_files,
-                    export_type = EXCLUDED.export_type
+                    export_type = EXCLUDED.export_type,
+                    organization_id = EXCLUDED.organization_id
             """,
                 [
                     export_id,
@@ -164,6 +192,7 @@ class ExportTracker:
                     parquet_urls,
                     local_files,
                     export_type,
+                    organization_id,
                 ],
             )
 
@@ -188,7 +217,8 @@ class ExportTracker:
                     file_count,
                     row_count,
                     parquet_urls,
-                    local_files
+                    local_files,
+                    organization_id
                 FROM exports
                 WHERE export_id = ?
             """,
@@ -205,29 +235,39 @@ class ExportTracker:
                 "row_count": result[5],
                 "parquet_urls": result[6],
                 "local_files": result[7],
+                "organization_id": result[8],
             }
 
         return None
 
-    def list_exports(self, limit: int = 10, export_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_exports(
+        self, limit: int = 10, export_type: Optional[str] = None, organization_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """
         List recent exports.
 
         Args:
             limit: Maximum number of exports to return
             export_type: Optional export type to filter by
+            organization_id: Optional tenant scope to filter by
 
         Returns:
             List of export metadata dictionaries
         """
         sql = """
-            SELECT export_id, export_date, created_at, status, file_count, row_count, export_type
+            SELECT export_id, export_date, created_at, status, file_count, row_count, export_type, organization_id
             FROM exports
         """
+        conditions: list = []
         params: list = []
         if export_type is not None:
-            sql += " WHERE export_type = ?"
+            conditions.append("export_type = ?")
             params.append(export_type)
+        if organization_id is not None:
+            conditions.append("organization_id = ?")
+            params.append(organization_id)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
 
@@ -243,6 +283,7 @@ class ExportTracker:
                 "file_count": row[4],
                 "row_count": row[5],
                 "export_type": row[6],
+                "organization_id": row[7],
             }
             for row in results
         ]

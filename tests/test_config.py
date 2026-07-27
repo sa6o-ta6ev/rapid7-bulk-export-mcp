@@ -74,4 +74,5 @@ class TestLoadConfig:
             assert "api_key" in config
             assert "region" in config
             assert "endpoint" in config
-            assert len(config) == 3  # Ensure no extra keys
+            assert "organization_id" in config
+            assert len(config) == 4  # Ensure no extra keys

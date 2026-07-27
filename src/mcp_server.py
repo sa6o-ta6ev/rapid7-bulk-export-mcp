@@ -10,11 +10,12 @@ import datetime as _dt
 import glob
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import duckdb as _duckdb
 from fastmcp import FastMCP
@@ -31,13 +32,19 @@ from .export_manager import (
     create_vulnerability_export,
     get_export_status,
 )
-from .export_tracker import ExportTracker
+from .export_tracker import DEFAULT_ORG_ID, ExportTracker
 
 # Initialize FastMCP server
 mcp = FastMCP("rapid7-bulk-export")
 
-# Global database instance
-db: Optional[VulnerabilityDatabase] = None
+# Org-keyed database instances. "default" (DEFAULT_ORG_ID) is the unscoped,
+# single-tenant store used when no organization_id is passed to a tool —
+# this preserves today's exact behavior and paths.
+_db_instances: Dict[str, VulnerabilityDatabase] = {}
+
+# CLI positional arg override for the default org's database path, captured
+# in main() and applied lazily the first time the default db is requested.
+_default_db_path_override: Optional[str] = None
 
 # Data directory — resolved once at startup, used for all database paths.
 # Defaults to ~/.rapid7_mcp so relative-path writes never hit a read-only CWD.
@@ -45,14 +52,45 @@ _DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "~/.rapid7_mcp")).expanduser()
 
 VALID_EXPORT_TYPES = ("vulnerability", "policy", "remediation", "asset_software")
 
+# Rapid7 customer/tenant org IDs are UUIDs; keep this permissive but safe for
+# use as a filesystem path segment (no separators, no "..").
+_ORG_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
-def initialize_database(db_path: Optional[str] = None) -> VulnerabilityDatabase:
-    """Initialize the vulnerability database."""
-    global db
-    if db is None:
-        resolved = db_path or str(_DATA_DIR / "rapid7_bulk_export.db")
-        db = VulnerabilityDatabase(resolved)
-    return db
+
+def _org_data_dir(organization_id: Optional[str]) -> Path:
+    """Return the data directory root for a given organization_id.
+
+    None/"" returns _DATA_DIR unchanged — identical to today's single-tenant
+    paths. A truthy organization_id returns an isolated per-org subdirectory
+    under _DATA_DIR/orgs/, created on demand.
+    """
+    if not organization_id:
+        return _DATA_DIR
+
+    if not _ORG_ID_PATTERN.match(organization_id):
+        raise ValueError(
+            f"Invalid organization_id: {organization_id!r}. Must contain only "
+            "letters, digits, hyphens, or underscores (e.g. a Rapid7 customer UUID)."
+        )
+
+    orgs_root = (_DATA_DIR / "orgs").resolve()
+    org_dir = (orgs_root / organization_id).resolve()
+    # Containment check, same idea as the ALLOWED_ROOT check in load_rapid7_parquet.
+    org_dir.relative_to(orgs_root)
+    org_dir.mkdir(parents=True, exist_ok=True)
+    return org_dir
+
+
+def _get_db(organization_id: str = "") -> VulnerabilityDatabase:
+    """Lazily get or create the VulnerabilityDatabase for one organization."""
+    key = organization_id or DEFAULT_ORG_ID
+    if key not in _db_instances:
+        if key == DEFAULT_ORG_ID and _default_db_path_override:
+            resolved = _default_db_path_override
+        else:
+            resolved = str(_org_data_dir(organization_id) / "rapid7_bulk_export.db")
+        _db_instances[key] = VulnerabilityDatabase(resolved)
+    return _db_instances[key]
 
 
 @mcp.tool(
@@ -64,7 +102,7 @@ def initialize_database(db_path: Optional[str] = None) -> VulnerabilityDatabase:
         openWorldHint=False,
     )
 )
-def load_rapid7_parquet(parquet_path: str) -> str:
+def load_rapid7_parquet(parquet_path: str, organization_id: str = "") -> str:
     """Load vulnerability data from existing Parquet file(s).
 
     Use this if you already have Parquet files downloaded and want to skip
@@ -72,14 +110,15 @@ def load_rapid7_parquet(parquet_path: str) -> str:
 
     Args:
         parquet_path: Path to a Parquet file or directory containing Parquet files
+        organization_id: Optional Rapid7 customer/tenant org ID. When provided,
+            loads into that tenant's isolated cache under
+            DATA_DIR/orgs/<organization_id>/ instead of the default store.
 
     Returns:
         Summary of loaded data including row count and statistics.
     """
-    global db
-
     try:
-        ALLOWED_ROOT = (_DATA_DIR / "imports").resolve()
+        ALLOWED_ROOT = (_org_data_dir(organization_id) / "imports").resolve()
 
         # Resolve and validate path is within allowed root
         resolved = Path(parquet_path).resolve()
@@ -105,9 +144,7 @@ def load_rapid7_parquet(parquet_path: str) -> str:
         if not parquet_files:
             return f"✗ Error: No Parquet files found at: {resolved}"
 
-        # Initialize database if needed
-        if db is None:
-            initialize_database()
+        db = _get_db(organization_id)
 
         # Detect file types by peeking at schema and build prefix map
         prefix_file_map: dict = {}
@@ -161,6 +198,7 @@ def start_rapid7_export(
     export_type: str = "vulnerability",
     start_date: str = "",
     end_date: str = "",
+    organization_id: str = "",
 ) -> str:
     """Start a new Rapid7 export job (non-blocking).
 
@@ -186,6 +224,11 @@ def start_rapid7_export(
                     Defaults to 30 days ago if not specified.
         end_date: End date in YYYY-MM-DD format (only for remediation exports).
                   Defaults to today if not specified.
+        organization_id: Optional Rapid7 customer/tenant org ID. When provided,
+            uses the Multi-Tenant API key (RAPID7_MULTI_TENANT_API_KEY) and
+            sends R7-Organization-Id to scope this export to that tenant, and
+            caches it under DATA_DIR/orgs/<organization_id>/ separately from
+            other tenants. Omit for the default single-tenant behavior.
 
     Returns:
         The export ID and next steps.
@@ -194,12 +237,13 @@ def start_rapid7_export(
         return f"✗ Invalid export_type: '{export_type}'. Valid values are: {', '.join(VALID_EXPORT_TYPES)}"
 
     try:
-        config = load_config()
+        config = load_config(organization_id or None)
+        org_key = organization_id or DEFAULT_ORG_ID
 
-        tracker = ExportTracker(str(_DATA_DIR / "rapid7_bulk_export_tracking.db"))
+        tracker = ExportTracker(str(_org_data_dir(organization_id) / "rapid7_bulk_export_tracking.db"))
 
         # Return a cached export from today unless it's remediation (which is date-range keyed)
-        today_export = tracker.get_today_export(export_type=export_type)
+        today_export = tracker.get_today_export(export_type=export_type, organization_id=org_key)
         if today_export and export_type != "remediation":
             tracker.close()
             eid = today_export["export_id"]
@@ -220,7 +264,9 @@ def start_rapid7_export(
             print("Creating new vulnerability export...", file=sys.stderr)
             new_id = create_vulnerability_export(config)
             print(f"Created {export_type} export with ID: {new_id}", file=sys.stderr)
-            tracker.save_export(export_id=new_id, status="PENDING", parquet_urls=[], export_type=export_type)
+            tracker.save_export(
+                export_id=new_id, status="PENDING", parquet_urls=[], export_type=export_type, organization_id=org_key
+            )
             tracker.close()
 
             return (
@@ -238,7 +284,9 @@ def start_rapid7_export(
             print("Creating new policy export...", file=sys.stderr)
             new_id = create_policy_export(config)
             print(f"Created {export_type} export with ID: {new_id}", file=sys.stderr)
-            tracker.save_export(export_id=new_id, status="PENDING", parquet_urls=[], export_type=export_type)
+            tracker.save_export(
+                export_id=new_id, status="PENDING", parquet_urls=[], export_type=export_type, organization_id=org_key
+            )
             tracker.close()
 
             return (
@@ -265,7 +313,13 @@ def start_rapid7_export(
                 print(f"Creating remediation export: {chunk_start} → {chunk_end}", file=sys.stderr)
                 eid = create_remediation_export(config, chunk_start, chunk_end)
                 export_ids.append({"id": eid, "start": chunk_start, "end": chunk_end})
-                tracker.save_export(export_id=eid, status="PENDING", parquet_urls=[], export_type="remediation")
+                tracker.save_export(
+                    export_id=eid,
+                    status="PENDING",
+                    parquet_urls=[],
+                    export_type="remediation",
+                    organization_id=org_key,
+                )
             tracker.close()
 
             lines = [
@@ -287,7 +341,13 @@ def start_rapid7_export(
         elif export_type == "asset_software":
             new_id = create_asset_software_export(config)
             print(f"Created asset_software export with ID: {new_id}", file=sys.stderr)
-            tracker.save_export(export_id=new_id, status="PENDING", parquet_urls=[], export_type="asset_software")
+            tracker.save_export(
+                export_id=new_id,
+                status="PENDING",
+                parquet_urls=[],
+                export_type="asset_software",
+                organization_id=org_key,
+            )
             tracker.close()
 
             return (
@@ -314,7 +374,7 @@ def start_rapid7_export(
         openWorldHint=True,
     )
 )
-def check_rapid7_export_status(export_id: str) -> str:
+def check_rapid7_export_status(export_id: str, organization_id: str = "") -> str:
     """Check the current status of a Rapid7 export job.
 
     This is a fast, non-blocking call that queries the Rapid7 API once
@@ -322,12 +382,14 @@ def check_rapid7_export_status(export_id: str) -> str:
 
     Args:
         export_id: The export ID returned by start_rapid7_export.
+        organization_id: Optional Rapid7 customer/tenant org ID — pass the
+            same value used in start_rapid7_export for this export, if any.
 
     Returns:
         Current export status and next steps.
     """
     try:
-        config = load_config()
+        config = load_config(organization_id or None)
         status_info = get_export_status(config, export_id)
         current_status = status_info["status"]
         file_count = len(status_info.get("parquetFiles", []))
@@ -373,7 +435,7 @@ def check_rapid7_export_status(export_id: str) -> str:
         openWorldHint=True,
     )
 )
-def download_rapid7_export(export_id: str, export_type: str = "vulnerability") -> str:
+def download_rapid7_export(export_id: str, export_type: str = "vulnerability", organization_id: str = "") -> str:
     """Download a completed Rapid7 export and load into the database.
 
     Call this after check_rapid7_export_status confirms the export is COMPLETE.
@@ -384,17 +446,19 @@ def download_rapid7_export(export_id: str, export_type: str = "vulnerability") -
         export_id: The export ID of a completed export.
         export_type: Type of export. One of "vulnerability", "policy",
                      or "remediation".
+        organization_id: Optional Rapid7 customer/tenant org ID — pass the
+            same value used in start_rapid7_export for this export, if any.
+            Loads into that tenant's isolated cache under
+            DATA_DIR/orgs/<organization_id>/.
 
     Returns:
         Summary of loaded data including row counts and statistics.
     """
-    global db
-
     if export_type not in VALID_EXPORT_TYPES:
         return f"✗ Invalid export_type: '{export_type}'. Valid values are: {', '.join(VALID_EXPORT_TYPES)}"
 
     try:
-        config = load_config()
+        config = load_config(organization_id or None)
 
         # Verify export is complete
         status_info = get_export_status(config, export_id)
@@ -416,11 +480,9 @@ def download_rapid7_export(export_id: str, export_type: str = "vulnerability") -
 
         # Download files
         print(f"Downloading {len(parquet_urls)} {export_type} files...", file=sys.stderr)
-        file_data = download_all_files(parquet_urls, config["api_key"])
+        file_data = download_all_files(parquet_urls, config["api_key"], organization_id=organization_id or None)
 
-        # Initialize database if needed
-        if db is None:
-            initialize_database()
+        db = _get_db(organization_id)
 
         temp_dir = tempfile.mkdtemp()
         validation_warnings = []
@@ -463,13 +525,14 @@ def download_rapid7_export(export_id: str, export_type: str = "vulnerability") -
                 )
 
             # Save export metadata
-            tracker = ExportTracker(str(_DATA_DIR / "rapid7_bulk_export_tracking.db"))
+            tracker = ExportTracker(str(_org_data_dir(organization_id) / "rapid7_bulk_export_tracking.db"))
             tracker.save_export(
                 export_id=export_id,
                 status="COMPLETE",
                 parquet_urls=parquet_urls,
                 row_count=row_count,
                 export_type=export_type,
+                organization_id=organization_id or DEFAULT_ORG_ID,
             )
             tracker.close()
 
@@ -516,7 +579,7 @@ def download_rapid7_export(export_id: str, export_type: str = "vulnerability") -
         openWorldHint=False,
     )
 )
-def query_rapid7(sql: str) -> str:
+def query_rapid7(sql: str, organization_id: str = "") -> str:
     """Execute a SQL query against the Rapid7 database.
 
     The database contains the following tables loaded from Rapid7 InsightVM
@@ -556,15 +619,24 @@ def query_rapid7(sql: str) -> str:
     - SELECT * FROM policies WHERE finalStatus = 'fail' LIMIT 10
     - SELECT cveId, COUNT(*) FROM vulnerability_remediation GROUP BY cveId
 
+    Note: the `orgId` column above is Rapid7's own per-row tenant field,
+    distinct from the `organization_id` parameter this tool accepts — after
+    switching tenants via organization_id, `SELECT DISTINCT orgId FROM
+    assets` is a good sanity check that you're looking at the expected
+    tenant's data.
+
     Args:
         sql: SQL query to execute against the database
+        organization_id: Optional Rapid7 customer/tenant org ID. When
+            provided, queries that tenant's isolated cache instead of the
+            default store.
 
     Returns:
         Query results as formatted JSON
     """
-    global db
+    db = _get_db(organization_id)
 
-    if db is None or not db.has_data():
+    if not db.has_data():
         return "Error: No data loaded. Please run start_rapid7_export and download_rapid7_export first."
 
     try:
@@ -584,7 +656,7 @@ def query_rapid7(sql: str) -> str:
         openWorldHint=False,
     )
 )
-def get_rapid7_schema() -> str:
+def get_rapid7_schema(organization_id: str = "") -> str:
     """Get the schema of all database tables.
 
     Returns column names and data types for all existing tables:
@@ -593,12 +665,17 @@ def get_rapid7_schema() -> str:
 
     Use this to understand what data is available before writing queries.
 
+    Args:
+        organization_id: Optional Rapid7 customer/tenant org ID. When
+            provided, inspects that tenant's isolated cache instead of the
+            default store.
+
     Returns:
         Table schemas as formatted JSON, keyed by table name
     """
-    global db
+    db = _get_db(organization_id)
 
-    if db is None or not db.has_data():
+    if not db.has_data():
         return "Error: No data loaded. Please run start_rapid7_export and download_rapid7_export first."
 
     try:
@@ -618,7 +695,7 @@ def get_rapid7_schema() -> str:
         openWorldHint=False,
     )
 )
-def get_rapid7_stats() -> str:
+def get_rapid7_stats(organization_id: str = "") -> str:
     """Get summary statistics for all database tables.
 
     Returns row counts and relevant distributions for all existing tables:
@@ -627,12 +704,17 @@ def get_rapid7_stats() -> str:
 
     Useful for getting an overview of the data across all loaded datasets.
 
+    Args:
+        organization_id: Optional Rapid7 customer/tenant org ID. When
+            provided, summarizes that tenant's isolated cache instead of the
+            default store.
+
     Returns:
         Summary statistics as formatted JSON, keyed by table name
     """
-    global db
+    db = _get_db(organization_id)
 
-    if db is None or not db.has_data():
+    if not db.has_data():
         return "Error: No data loaded. Please run start_rapid7_export and download_rapid7_export first."
 
     try:
@@ -652,37 +734,44 @@ def get_rapid7_stats() -> str:
         openWorldHint=False,
     )
 )
-def purge_rapid7_data() -> str:
-    """Permanently delete all local Rapid7 data and tracking databases.
+def purge_rapid7_data(organization_id: str = "") -> str:
+    """Permanently delete local Rapid7 data and tracking databases for one tenant.
 
     This removes:
     - The main vulnerability database (rapid7_bulk_export.db)
     - The export tracking database (rapid7_bulk_export_tracking.db)
     - Any associated WAL files
 
+    Only purges the given organization_id's cache (or the default/unscoped
+    store if omitted) — other tenants' data under orgs/<other_id>/ is
+    untouched.
+
     Use this when you are done with your analysis session, before handing
     off a machine, or to free disk space. After purging, you will need to
     run a new export to query data again.
 
+    Args:
+        organization_id: Optional Rapid7 customer/tenant org ID identifying
+            which tenant's cache to purge. Omit to purge only the default
+            (unscoped) store.
+
     Returns:
         Confirmation of purged data.
     """
-    global db
-
     try:
-        # Purge main database
-        if db is not None:
-            db.purge()
+        db = _get_db(organization_id)
+        db.purge()
 
-        # Purge tracking database
-        tracker = ExportTracker(str(_DATA_DIR / "rapid7_bulk_export_tracking.db"))
+        tracker = ExportTracker(str(_org_data_dir(organization_id) / "rapid7_bulk_export_tracking.db"))
         tracker.purge()
 
+        scope = f"organization_id={organization_id}" if organization_id else "the default (unscoped) store"
         return (
-            "✓ All local Rapid7 data has been purged.\n\n"
+            f"✓ Local Rapid7 data has been purged for {scope}.\n\n"
             "Deleted:\n"
             "  - Vulnerability database (rapid7_bulk_export.db)\n"
             "  - Export tracking database (rapid7_bulk_export_tracking.db)\n\n"
+            "Other tenants' caches (if any) were not affected.\n\n"
             "To load new data, run start_rapid7_export() followed by download_rapid7_export()."
         )
 
@@ -699,7 +788,7 @@ def purge_rapid7_data() -> str:
         openWorldHint=False,
     )
 )
-def list_rapid7_exports(limit: int = 10) -> str:
+def list_rapid7_exports(limit: int = 10, organization_id: str = "") -> str:
     """List recent Rapid7 exports tracked in the system.
 
     Shows export metadata including export ID, date, status, type, and row counts.
@@ -707,13 +796,16 @@ def list_rapid7_exports(limit: int = 10) -> str:
 
     Args:
         limit: Maximum number of exports to return (default: 10)
+        organization_id: Optional Rapid7 customer/tenant org ID. When
+            provided, lists that tenant's tracked exports instead of the
+            default store's.
 
     Returns:
         Formatted list of recent exports
     """
     try:
-        tracker = ExportTracker(str(_DATA_DIR / "rapid7_bulk_export_tracking.db"))
-        exports = tracker.list_exports(limit=limit)
+        tracker = ExportTracker(str(_org_data_dir(organization_id) / "rapid7_bulk_export_tracking.db"))
+        exports = tracker.list_exports(limit=limit, organization_id=organization_id or DEFAULT_ORG_ID)
         tracker.close()
 
         if not exports:
@@ -737,6 +829,8 @@ def list_rapid7_exports(limit: int = 10) -> str:
 
 def main():
     """Entry point for the MCP server command."""
+    global _default_db_path_override
+
     # Handle help flag
     if len(sys.argv) > 1 and sys.argv[1] in ["--help", "-h"]:
         print("Usage: rapid7-mcp-server [database_path]")
@@ -747,12 +841,20 @@ def main():
         print("  database_path    Path to the DuckDB database file (optional, overrides DATA_DIR default)")
         print()
         print("Environment Variables:")
-        print("  RAPID7_API_KEY    Your Rapid7 InsightVM API key (required)")
-        print("  RAPID7_REGION     Your Rapid7 region: us, eu, ca, au, or ap (required)")
-        print("  DATA_DIR          Directory for database files (default: ~/.rapid7_mcp)")
-        print("  MCP_TRANSPORT     Transport protocol: 'stdio' (default) or 'http'")
-        print("  MCP_HOST          HTTP bind address (default: 0.0.0.0)")
-        print("  MCP_PORT          HTTP port (default: 8000)")
+        print("  RAPID7_API_KEY              Your Rapid7 InsightVM API key (required)")
+        print("  RAPID7_MULTI_TENANT_API_KEY Rapid7 Multi-Tenant Admin/User API key (required only")
+        print("                              when calling a tool with organization_id set)")
+        print("  RAPID7_REGION               Your Rapid7 region: us, eu, ca, au, or ap (required)")
+        print("  DATA_DIR                    Directory for database files (default: ~/.rapid7_mcp)")
+        print("  MCP_TRANSPORT               Transport protocol: 'stdio' (default) or 'http'")
+        print("  MCP_HOST                    HTTP bind address (default: 0.0.0.0)")
+        print("  MCP_PORT                    HTTP port (default: 8000)")
+        print()
+        print("Tool parameter:")
+        print("  organization_id  Optional, accepted by most tools (not an env var). Scopes that")
+        print("                   call's data/tracking under DATA_DIR/orgs/<organization_id>/ and")
+        print("                   sends R7-Organization-Id using the Multi-Tenant API key. Omit for")
+        print("                   default single-tenant behavior.")
         print()
         print("Example:")
         print("  rapid7-mcp-server /path/to/rapid7_bulk_export.db")
@@ -766,16 +868,17 @@ def main():
     # Ensure data directory exists
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Get database path from args or use default
-    db_path = sys.argv[1] if len(sys.argv) > 1 else str(_DATA_DIR / "rapid7_bulk_export.db")
+    # Stash the CLI override for the default org's database path — applied
+    # lazily the first time it's actually needed, since databases now
+    # initialize per-organization on demand rather than eagerly at startup.
+    if len(sys.argv) > 1:
+        _default_db_path_override = sys.argv[1]
+        print(f"Default database path override: {_default_db_path_override}", file=sys.stderr)
 
-    # Initialize database
-    try:
-        initialize_database(db_path)
-        print(f"Initialized database from: {db_path}", file=sys.stderr)
-    except Exception as e:
-        print(f"Warning: Could not initialize database: {e}", file=sys.stderr)
-        print("Database will be created when data is loaded.", file=sys.stderr)
+    print(
+        "Rapid7 MCP server ready (multi-tenant mode: databases initialize lazily per organization_id).",
+        file=sys.stderr,
+    )
 
     # Determine transport mode from environment
     transport = os.environ.get("MCP_TRANSPORT", "stdio")

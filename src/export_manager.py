@@ -33,7 +33,12 @@ def _create_simple_export(config: Dict[str, str], mutation_name: str, response_k
     }}
     """
     try:
-        response = send_graphql_request(endpoint=config["endpoint"], api_key=config["api_key"], query=mutation)
+        response = send_graphql_request(
+            endpoint=config["endpoint"],
+            api_key=config["api_key"],
+            query=mutation,
+            organization_id=config.get("organization_id"),
+        )
         return response["data"][response_key]["id"]
     except ValueError as e:
         export_id = _extract_in_progress_id(str(e))
@@ -180,7 +185,11 @@ def create_remediation_export(config: Dict[str, str], start_date: str, end_date:
 
     try:
         response = send_graphql_request(
-            endpoint=config["endpoint"], api_key=config["api_key"], query=mutation, variables=variables
+            endpoint=config["endpoint"],
+            api_key=config["api_key"],
+            query=mutation,
+            variables=variables,
+            organization_id=config.get("organization_id"),
         )
         return response["data"]["createVulnerabilityRemediationExport"]["id"]
 
@@ -219,7 +228,11 @@ def create_asset_software_export(config: Dict[str, str]) -> str:
 
     try:
         response = send_graphql_request(
-            endpoint=config["endpoint"], api_key=config["api_key"], query=mutation, variables=variables
+            endpoint=config["endpoint"],
+            api_key=config["api_key"],
+            query=mutation,
+            variables=variables,
+            organization_id=config.get("organization_id"),
         )
         return response["data"]["createAssetSoftwareExport"]["id"]
 
@@ -270,7 +283,12 @@ def get_export_status(config: Dict[str, str], export_id: str) -> Dict[str, Any]:
         % export_id
     )
 
-    response = send_graphql_request(endpoint=config["endpoint"], api_key=config["api_key"], query=query)
+    response = send_graphql_request(
+        endpoint=config["endpoint"],
+        api_key=config["api_key"],
+        query=query,
+        organization_id=config.get("organization_id"),
+    )
     export_data = response["data"]["export"]
 
     parquet_urls = []

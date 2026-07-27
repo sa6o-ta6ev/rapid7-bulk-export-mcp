@@ -14,7 +14,11 @@ from .config import USER_AGENT
 
 
 def send_graphql_request(
-    endpoint: str, api_key: str, query: str, variables: Optional[Dict[str, Any]] = None
+    endpoint: str,
+    api_key: str,
+    query: str,
+    variables: Optional[Dict[str, Any]] = None,
+    organization_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Send a GraphQL request to the Rapid7 API.
@@ -29,6 +33,9 @@ def send_graphql_request(
         api_key: The API key for authentication
         query: The GraphQL query or mutation string
         variables: Optional dictionary of GraphQL variables
+        organization_id: Optional Rapid7 customer/tenant org ID. When
+            provided, sent as the R7-Organization-Id header so a Multi-Tenant
+            Admin/User API key can target a specific managed tenant.
 
     Returns:
         The parsed JSON response as a dictionary
@@ -49,6 +56,8 @@ def send_graphql_request(
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
     }
+    if organization_id:
+        headers["R7-Organization-Id"] = organization_id
 
     # Build request body
     body: Dict[str, Any] = {"query": query}

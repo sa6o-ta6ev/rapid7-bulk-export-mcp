@@ -7,14 +7,14 @@ progress reporting and proper error handling.
 """
 
 import sys
-from typing import List
+from typing import List, Optional
 
 import requests
 
 from .config import USER_AGENT
 
 
-def download_parquet_file(url: str, api_key: str) -> bytes:
+def download_parquet_file(url: str, api_key: str, organization_id: Optional[str] = None) -> bytes:
     """
     Download a single Parquet file from the provided URL.
 
@@ -25,6 +25,8 @@ def download_parquet_file(url: str, api_key: str) -> bytes:
     Args:
         url: The URL to download the Parquet file from
         api_key: The API key for authorization
+        organization_id: Optional Rapid7 customer/tenant org ID, sent as the
+            R7-Organization-Id header for Multi-Tenant key requests.
 
     Returns:
         bytes: The file content as bytes
@@ -43,6 +45,8 @@ def download_parquet_file(url: str, api_key: str) -> bytes:
         "X-Api-Key": api_key,
         "User-Agent": USER_AGENT,
     }
+    if organization_id:
+        headers["R7-Organization-Id"] = organization_id
 
     # Stream download for memory efficiency
     response = requests.get(url, headers=headers, stream=True, timeout=30)
@@ -54,7 +58,7 @@ def download_parquet_file(url: str, api_key: str) -> bytes:
     return response.content
 
 
-def download_all_files(urls: List[str], api_key: str) -> List[bytes]:
+def download_all_files(urls: List[str], api_key: str, organization_id: Optional[str] = None) -> List[bytes]:
     """
     Download all Parquet files from the provided URLs.
 
@@ -65,6 +69,8 @@ def download_all_files(urls: List[str], api_key: str) -> List[bytes]:
     Args:
         urls: List of URLs to download Parquet files from
         api_key: The API key for authorization
+        organization_id: Optional Rapid7 customer/tenant org ID, sent as the
+            R7-Organization-Id header for Multi-Tenant key requests.
 
     Returns:
         List[bytes]: List of file contents as bytes, in the same order as the input URLs
@@ -83,7 +89,7 @@ def download_all_files(urls: List[str], api_key: str) -> List[bytes]:
 
     for i, url in enumerate(urls, start=1):
         print(f"Downloading file {i} of {len(urls)}...", file=sys.stderr)
-        content = download_parquet_file(url, api_key)
+        content = download_parquet_file(url, api_key, organization_id=organization_id)
         file_contents.append(content)
         print(f"Downloaded file {i} ({len(content)} bytes)", file=sys.stderr)
 

@@ -463,6 +463,8 @@ What's the severity distribution across my cloud assets?
 
 ## Tool Reference
 
+> Every tool below also accepts an optional `organization_id` parameter for querying a specific managed tenant instead of the account the API key belongs to — see [Multi-Tenant Support](#multi-tenant-support). It can be omitted entirely for single-tenant use, with no change in behavior.
+
 ### `start_rapid7_export`
 
 Kicks off a new export job on Rapid7's servers. Returns immediately with an export ID. Supports three export types: `vulnerability`, `policy`, and `remediation`.
@@ -531,11 +533,45 @@ List my recent exports
 
 ### `purge_rapid7_data`
 
-Permanently deletes both the vulnerability database and the export tracking database from disk. Use when you're done with analysis or before handing off a machine.
+Permanently deletes both the vulnerability database and the export tracking database from disk. Use when you're done with analysis or before handing off a machine. When `organization_id` is provided, only that tenant's cache is deleted — other tenants are untouched.
 
 ```
 Purge all local Rapid7 data
 ```
+
+## Multi-Tenant Support
+
+If you're an MSSP or otherwise manage multiple Rapid7-managed organizations from one primary account, you can query any of them from a single running server instance instead of reconfiguring and restarting per tenant.
+
+### How it works
+
+Every tool accepts an optional `organization_id` parameter:
+
+- **Omitted** (default): behaves exactly as in single-tenant mode — uses `RAPID7_API_KEY`, and data is stored under `DATA_DIR` (default `~/.rapid7_mcp/`) as usual.
+- **Provided**: uses `RAPID7_MULTI_TENANT_API_KEY` instead, sends the requested id as the `R7-Organization-Id` header (required by Rapid7's Multi-Tenant key model — a Multi-Tenant key has no default-organization fallback of its own), and isolates that tenant's data under `DATA_DIR/orgs/<organization_id>/` so it never mixes with the default tenant's data or another tenant's.
+
+This also means the same-day export-reuse check (`start_rapid7_export` won't recreate an export that already ran today) is itself scoped per `organization_id` — switching tenants can never accidentally return a different tenant's cached export.
+
+### Getting a Multi-Tenant API key
+
+1. Log in to the [Rapid7 Insight Platform](https://insight.rapid7.com) as a Platform Admin, from the **primary** account that manages the other organizations
+2. Navigate to Administration → API Key Management
+3. Open the **Multi-Tenant** tab and choose:
+   - **Multi-Tenant Admin key**: full administrative privileges across all managed tenants (Platform Admins only)
+   - **Multi-Tenant User key**: mirrors the creating user's own access per tenant
+4. Generate the key and set it as `RAPID7_MULTI_TENANT_API_KEY` in your MCP server config — do **not** replace `RAPID7_API_KEY` with it, since the two keys serve different call shapes (see above) and the multi-tenant key requires `organization_id` to be set on every call it's used for.
+5. You can look up a managed organization's id via the Rapid7 UI's Customer/Organization table, or the Get Managed Organizations API.
+
+### Example usage
+
+```
+Get vulnerability stats for organization_id <organization-id>
+```
+```
+Start a vulnerability export for organization_id <organization-id>
+```
+
+Only the region needs to match across tenants today — this fork assumes all managed organizations share one `RAPID7_REGION`. If your tenants span multiple regions, that would require an additional per-tenant region override (not currently implemented).
 
 ## Architecture
 
@@ -620,6 +656,7 @@ uv run pytest
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `RAPID7_API_KEY` | Yes | — | Rapid7 InsightVM API key |
+| `RAPID7_MULTI_TENANT_API_KEY` | No | — | Rapid7 Multi-Tenant Admin/User API key. Only required if you pass `organization_id` to a tool call — see [Multi-Tenant Support](#multi-tenant-support) |
 | `RAPID7_REGION` | Yes | `us` | API region: `us`, `us2`, `us3`, `eu`, `ca`, `au`, `ap` |
 | `DATA_DIR` | No | `~/.rapid7_mcp` | Directory for database files; must be writable. Manual parquet imports must be placed in `$DATA_DIR/imports/` |
 | `MCP_TRANSPORT` | No | `stdio` | Transport protocol: `stdio` or `http` |
