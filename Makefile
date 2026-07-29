@@ -1,7 +1,7 @@
 .PHONY: help version check-version bump-version lint lint-fix security test build \
        docker-build docker-build-slim docker-build-distroless docker-test docker-test-slim \
        docker-test-distroless docker-clean package-mcpb package-skill package clean \
-       create-release release
+       create-release release up down
 
 SHELL := /usr/bin/env bash
 VERSION := $(shell jq -r '.version' manifest.json)
@@ -93,6 +93,19 @@ local-test: ## Run end-to-end live test against the real Rapid7 API (requires RA
 
 docker-build: ## Build the Docker image (UBI Minimal)
 	docker build -t rapid7-bulk-export-mcp:$(VERSION) -t rapid7-bulk-export-mcp:latest .
+
+# ---------------------------------------------------------------------------
+# Docker Compose (remote/shared deployment stack)
+# ---------------------------------------------------------------------------
+
+build: ## Build the docker compose image
+	docker compose build
+
+up: ## Build and start the docker compose stack (detached)
+	docker compose up -d --build
+
+down: ## Stop and remove the docker compose stack
+	docker compose down
 
 docker-test: ## Test the Docker image (build, run, verify MCP endpoint)
 	@echo "Testing UBI Minimal image..."

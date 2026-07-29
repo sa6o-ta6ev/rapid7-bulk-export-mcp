@@ -17,12 +17,9 @@ services:
       - DATA_DIR=/data
       - TMPDIR=/tmp
     volumes:
-      - rapid7-data:/data
+      - /opt/data/bulk-export:/data
     read_only: true
     tmpfs:
       - /tmp
     security_opt:
       - no-new-privileges:true
-
-volumes:
-  rapid7-data:
