@@ -539,6 +539,14 @@ Permanently deletes both the vulnerability database and the export tracking data
 Purge all local Rapid7 data
 ```
 
+### `get_organization_ids`
+
+Lists every Rapid7-managed organization visible to your Multi-Tenant account, live from the Rapid7 API — name, id, and region for each. Use this to look up which `organization_id` to pass to the other tools above. See [Multi-Tenant Support](#multi-tenant-support).
+
+```
+List my Rapid7 organization ids
+```
+
 ## Multi-Tenant Support
 
 If you're an MSSP or otherwise manage multiple Rapid7-managed organizations from one primary account, you can query any of them from a single running server instance instead of reconfiguring and restarting per tenant.
@@ -560,7 +568,8 @@ This also means the same-day export-reuse check (`start_rapid7_export` won't rec
    - **Multi-Tenant Admin key**: full administrative privileges across all managed tenants (Platform Admins only)
    - **Multi-Tenant User key**: mirrors the creating user's own access per tenant
 4. Generate the key and set it as `RAPID7_MULTI_TENANT_API_KEY` in your MCP server config — do **not** replace `RAPID7_API_KEY` with it, since the two keys serve different call shapes (see above) and the multi-tenant key requires `organization_id` to be set on every call it's used for.
-5. You can look up a managed organization's id via the Rapid7 UI's Customer/Organization table, or the Get Managed Organizations API.
+5. Also set `RAPID7_PARENT_ORG_ID` to your **primary** account's own organization id (from the Rapid7 UI, or your account team) — this is required only by the `get_organization_ids` tool, and is distinct from any managed tenant's id.
+6. Call the `get_organization_ids` tool to list every managed organization's name, id, and region live — this is the recommended way to discover `organization_id` values for the tools above, and replaces any manual UI lookup or local tenant-list file.
 
 ### Example usage
 
@@ -656,7 +665,8 @@ uv run pytest
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `RAPID7_API_KEY` | Yes | — | Rapid7 InsightVM API key |
-| `RAPID7_MULTI_TENANT_API_KEY` | No | — | Rapid7 Multi-Tenant Admin/User API key. Only required if you pass `organization_id` to a tool call — see [Multi-Tenant Support](#multi-tenant-support) |
+| `RAPID7_MULTI_TENANT_API_KEY` | No | — | Rapid7 Multi-Tenant Admin/User API key. Only required if you pass `organization_id` to a tool call, or call `get_organization_ids` — see [Multi-Tenant Support](#multi-tenant-support) |
+| `RAPID7_PARENT_ORG_ID` | No | — | Your primary/parent account's own organization id (not a managed tenant's id). Only required for the `get_organization_ids` tool — see [Multi-Tenant Support](#multi-tenant-support) |
 | `RAPID7_REGION` | Yes | `us` | API region: `us`, `us2`, `us3`, `eu`, `ca`, `au`, `ap` |
 | `DATA_DIR` | No | `~/.rapid7_mcp` | Directory for database files; must be writable. Manual parquet imports must be placed in `$DATA_DIR/imports/` |
 | `MCP_TRANSPORT` | No | `stdio` | Transport protocol: `stdio` or `http` |

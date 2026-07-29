@@ -48,6 +48,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Local secrets
+.env
+.env.*
+
 # Project specific
 *.csv
 *.parquet

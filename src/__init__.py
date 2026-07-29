@@ -13,6 +13,7 @@ Modules:
     download: Parquet file downloading from the API
     data_processing: Data filtering, transformation, and CSV writing
     cli: Command-line interface and workflow orchestration
+    organizations_client: Discovery of Rapid7-managed organizations via the Insight Account API
 
 Usage:
     This package is typically used via the command-line interface:

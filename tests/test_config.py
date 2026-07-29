@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.config import REGION_ENDPOINTS, load_config
+from src.config import REGION_ENDPOINTS, load_config, load_parent_organization_config
 
 
 class TestLoadConfig:
@@ -76,3 +76,72 @@ class TestLoadConfig:
             assert "endpoint" in config
             assert "organization_id" in config
             assert len(config) == 4  # Ensure no extra keys
+
+
+class TestLoadParentOrganizationConfig:
+    """Tests for the load_parent_organization_config() function."""
+
+    def test_valid_environment(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RAPID7_MULTI_TENANT_API_KEY": "mt-key-123",
+                "RAPID7_PARENT_ORG_ID": "parent-org-abc",
+                "RAPID7_REGION": "eu",
+            },
+            clear=True,
+        ):
+            config = load_parent_organization_config()
+
+            assert config["api_key"] == "mt-key-123"
+            assert config["parent_organization_id"] == "parent-org-abc"
+            assert config["region"] == "eu"
+            assert len(config) == 3
+
+    def test_missing_region_defaults_to_us(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RAPID7_MULTI_TENANT_API_KEY": "mt-key-123",
+                "RAPID7_PARENT_ORG_ID": "parent-org-abc",
+            },
+            clear=True,
+        ):
+            config = load_parent_organization_config()
+            assert config["region"] == "us"
+
+    def test_invalid_region_raises_error(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RAPID7_MULTI_TENANT_API_KEY": "mt-key-123",
+                "RAPID7_PARENT_ORG_ID": "parent-org-abc",
+                "RAPID7_REGION": "not-a-region",
+            },
+            clear=True,
+        ):
+            with pytest.raises(ValueError, match="Invalid region: not-a-region"):
+                load_parent_organization_config()
+
+    def test_missing_multi_tenant_api_key_raises_error(self):
+        with patch.dict(
+            os.environ,
+            {"RAPID7_PARENT_ORG_ID": "parent-org-abc"},
+            clear=True,
+        ):
+            with pytest.raises(
+                ValueError, match="RAPID7_MULTI_TENANT_API_KEY environment variable is not set"
+            ):
+                load_parent_organization_config()
+
+    def test_missing_parent_organization_id_raises_error(self):
+        with patch.dict(
+            os.environ,
+            {"RAPID7_MULTI_TENANT_API_KEY": "mt-key-123"},
+            clear=True,
+        ):
+            with pytest.raises(
+                ValueError,
+                match="RAPID7_PARENT_ORG_ID environment variable is not set",
+            ):
+                load_parent_organization_config()

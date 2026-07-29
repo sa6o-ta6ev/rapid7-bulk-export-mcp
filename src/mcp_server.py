@@ -21,7 +21,7 @@ import duckdb as _duckdb
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from .config import load_config
+from .config import load_config, load_parent_organization_config
 from .download import download_all_files
 from .duckdb_loader import VulnerabilityDatabase
 from .export_manager import (
@@ -33,6 +33,7 @@ from .export_manager import (
     get_export_status,
 )
 from .export_tracker import DEFAULT_ORG_ID, ExportTracker
+from .organizations_client import filter_by_region, get_managed_organizations
 
 # Initialize FastMCP server
 mcp = FastMCP("rapid7-bulk-export")
@@ -827,6 +828,84 @@ def list_rapid7_exports(limit: int = 10, organization_id: str = "") -> str:
         return f"✗ Error listing exports: {str(e)}"
 
 
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get Organization IDs",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def get_organization_ids(region: str = "") -> str:
+    """List Rapid7-managed organizations (tenants) available to this account.
+
+    Calls the Rapid7 Insight Account API live (via your Multi-Tenant API
+    key) and returns every managed organization's name, id, and region. All
+    pages are fetched automatically.
+
+    By default, results are filtered to your configured RAPID7_REGION —
+    tenants in a different region can't currently be used with the other
+    tools anyway (they all require RAPID7_REGION to match the target
+    tenant's region). Pass region="all" to see every managed organization
+    regardless of region, or pass a specific region code (e.g. "us") to see
+    only that one.
+
+    Use the id from this list as the organization_id argument on other
+    tools (start_rapid7_export, query_rapid7, purge_rapid7_data, etc.) —
+    match the tenant's name here to get its id, then reuse that id across
+    subsequent tool calls.
+
+    Requires RAPID7_MULTI_TENANT_API_KEY and RAPID7_PARENT_ORG_ID
+    to be set in the server's environment. RAPID7_PARENT_ORG_ID is
+    your own primary/parent account's organization id — not any managed
+    tenant's id — since the Rapid7 API has no endpoint to look this up
+    automatically.
+
+    Args:
+        region: Optional region code to filter results to (e.g. "eu").
+            Defaults to your configured RAPID7_REGION. Pass "all" to
+            bypass filtering and see every managed organization.
+
+    Returns:
+        One line per managed organization in the form
+        "- <name> (id: <id>, region: <region>)", or an error message if
+        required environment variables are missing or the API call fails.
+    """
+    try:
+        config = load_parent_organization_config()
+        organizations = get_managed_organizations(
+            api_key=config["api_key"],
+            region=config["region"],
+            parent_organization_id=config["parent_organization_id"],
+        )
+
+        effective_region = region or config["region"]
+        if effective_region.lower() != "all":
+            organizations = filter_by_region(organizations, effective_region)
+
+        if not organizations:
+            return f"No managed organizations found (region filter: {effective_region})."
+
+        label = "all regions" if effective_region.lower() == "all" else f"region '{effective_region}'"
+        lines = [f"Managed organizations in {label} ({len(organizations)}):\n"]
+        for org in organizations:
+            name = org.get("name", "<unknown>")
+            org_id = org.get("id", "<unknown>")
+            org_region = org.get("region", "<unknown>")
+            lines.append(f"- {name} (id: {org_id}, region: {org_region})")
+
+        lines.append(
+            "\nUse one of the ids above as the organization_id parameter on "
+            "other tools (e.g. start_rapid7_export, query_rapid7). Pass "
+            'region="all" to this tool to see organizations in other regions.'
+        )
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"✗ Error listing managed organizations: {str(e)}"
+
+
 def main():
     """Entry point for the MCP server command."""
     global _default_db_path_override
@@ -843,7 +922,11 @@ def main():
         print("Environment Variables:")
         print("  RAPID7_API_KEY              Your Rapid7 InsightVM API key (required)")
         print("  RAPID7_MULTI_TENANT_API_KEY Rapid7 Multi-Tenant Admin/User API key (required only")
-        print("                              when calling a tool with organization_id set)")
+        print("                              when calling a tool with organization_id set, or")
+        print("                              when calling get_organization_ids)")
+        print("  RAPID7_PARENT_ORG_ID Your primary/parent account's own org id (required")
+        print("                              only for the get_organization_ids tool; not a")
+        print("                              managed tenant's id)")
         print("  RAPID7_REGION               Your Rapid7 region: us, eu, ca, au, or ap (required)")
         print("  DATA_DIR                    Directory for database files (default: ~/.rapid7_mcp)")
         print("  MCP_TRANSPORT               Transport protocol: 'stdio' (default) or 'http'")

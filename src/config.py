@@ -77,3 +77,54 @@ def load_config(organization_id: Optional[str] = None) -> Dict[str, str]:
         "endpoint": endpoint,
         "organization_id": organization_id or "",
     }
+
+
+def load_parent_organization_config() -> Dict[str, str]:
+    """Load config for calling Rapid7 APIs as the parent/primary account.
+
+    Used only by organizations_client.get_managed_organizations(). This is
+    architecturally distinct from load_config(): that function scopes a
+    request to a *target* tenant via an R7-Organization-Id header carrying
+    the tenant's own id, whereas this one authenticates *as* the parent
+    account itself — whose org id has no self-lookup/whoami endpoint in the
+    Rapid7 API, so it must come from configuration.
+
+    Reads:
+        RAPID7_MULTI_TENANT_API_KEY: required.
+        RAPID7_REGION: optional, defaults to "us", validated against
+            REGION_ENDPOINTS (same valid set as load_config uses).
+        RAPID7_PARENT_ORG_ID: required — the primary/parent
+            account's own organization id (NOT a managed tenant's id).
+
+    Returns:
+        dict: {"api_key": str, "region": str, "parent_organization_id": str}
+
+    Raises:
+        ValueError: If RAPID7_MULTI_TENANT_API_KEY or
+            RAPID7_PARENT_ORG_ID is unset, or region is invalid.
+    """
+    region = os.environ.get("RAPID7_REGION", "us")
+    if region not in REGION_ENDPOINTS:
+        valid_regions = ", ".join(sorted(REGION_ENDPOINTS.keys()))
+        raise ValueError(f"Invalid region: {region}. Valid regions are: {valid_regions}")
+
+    api_key = os.environ.get("RAPID7_MULTI_TENANT_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "RAPID7_MULTI_TENANT_API_KEY environment variable is not set "
+            "(required to list managed organizations)"
+        )
+
+    parent_organization_id = os.environ.get("RAPID7_PARENT_ORG_ID")
+    if not parent_organization_id:
+        raise ValueError(
+            "RAPID7_PARENT_ORG_ID environment variable is not set "
+            "(this is your primary/parent account's own organization id, "
+            "not a managed tenant's id)"
+        )
+
+    return {
+        "api_key": api_key,
+        "region": region,
+        "parent_organization_id": parent_organization_id,
+    }
