@@ -51,6 +51,7 @@ Thumbs.db
 # Local secrets
 .env
 .env.*
+!.env.example
 
 # Project specific
 *.csv

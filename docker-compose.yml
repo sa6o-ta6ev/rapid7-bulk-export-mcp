@@ -4,9 +4,14 @@ services:
     image: rapid7-bulk-export-mcp
     container_name: rapid7-bulk-export-mcp
     ports:
-      - "8000:8000"
+      # Bound to localhost only — put a Cloudflare Tunnel (or reverse proxy)
+      # in front rather than exposing this port to the internet directly,
+      # since the /mcp endpoint has no authentication of its own.
+      - "127.0.0.1:8000:8000"
     environment:
-      - RAPID7_API_KEY=${RAPID7_API_KEY}
+      - RAPID7_API_KEY=${RAPID7_API_KEY:-}
+      - RAPID7_MULTI_TENANT_API_KEY=${RAPID7_MULTI_TENANT_API_KEY:-}
+      - RAPID7_PARENT_ORG_ID=${RAPID7_PARENT_ORG_ID:-}
       - RAPID7_REGION=${RAPID7_REGION}
       - MCP_TRANSPORT=http
       - DATA_DIR=/data
