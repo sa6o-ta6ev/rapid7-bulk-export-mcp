@@ -16,4 +16,9 @@ set +a
 
 mkdir -p "${DATA_DIR:-$HOME/.rapid7_mcp}/logs"
 
-exec /home/s460/rapid7/bulk-export-mcp/.venv/bin/python -m src.daily_sync
+# `uv run` manages this project's own .venv from pyproject.toml/uv.lock (creating it on first
+# run if needed) — portable across hosts, unlike a hardcoded path to one specific machine's venv
+# (this used to point at a sibling workspace's venv on one dev machine and broke immediately on
+# any other host). Requires `uv` on PATH, same prerequisite the workspace README already states.
+cd "$SCRIPT_DIR"
+exec uv run python -m src.daily_sync
