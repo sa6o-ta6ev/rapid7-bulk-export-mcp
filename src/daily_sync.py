@@ -431,8 +431,13 @@ def main() -> int:
         result = sync_one_tenant(tenant)
         logger.info("Tenant %s: status=%s export_types=%s", tenant["name"], result["status"], result.get("export_types"))
         results.append(result)
+        # Write after every tenant, not just once at the end -- a full run across many tenants
+        # can take hours, and rapid7-mcp-server's Clients tab should show each tenant's data as
+        # soon as it's ready rather than nothing at all until the entire run finishes (confirmed
+        # live: checking the tab mid-run found no registry file yet). Also means a mid-run crash
+        # still leaves a registry reflecting whatever did complete, not nothing.
+        write_registry_atomically(REGISTRY_PATH, results)
 
-    write_registry_atomically(REGISTRY_PATH, results)
     logger.info("Registry written to %s", REGISTRY_PATH)
 
     return 1 if any(r["status"] == "failed" for r in results) else 0
