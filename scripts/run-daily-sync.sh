@@ -14,11 +14,18 @@ set -a
 source "$SCRIPT_DIR/.env"
 set +a
 
+# cron's PATH is minimal (typically just /usr/bin:/bin) and won't include wherever `uv` actually
+# lives — confirmed live that `uv` only resolves via ~/.local/bin, added to PATH by interactive
+# shell profiles cron never sources. Prepend the common install locations explicitly rather than
+# assume the invoking environment's PATH is sufficient (same class of fix as sourcing .env above).
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+
 mkdir -p "${DATA_DIR:-$HOME/.rapid7_mcp}/logs"
 
 # `uv run` manages this project's own .venv from pyproject.toml/uv.lock (creating it on first
 # run if needed) — portable across hosts, unlike a hardcoded path to one specific machine's venv
 # (this used to point at a sibling workspace's venv on one dev machine and broke immediately on
-# any other host). Requires `uv` on PATH, same prerequisite the workspace README already states.
+# any other host). Requires `uv` on PATH (see above), same prerequisite the workspace README
+# already states.
 cd "$SCRIPT_DIR"
 exec uv run python -m src.daily_sync
