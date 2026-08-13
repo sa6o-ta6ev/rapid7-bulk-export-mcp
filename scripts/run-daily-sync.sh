@@ -22,23 +22,6 @@ export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 
 mkdir -p "${DATA_DIR:-$HOME/.rapid7_mcp}/logs"
 
-# Regenerate the vm-sync allowlist (rapid7-mcp-server's tenants.vm_org_id) right before the
-# sync itself, so daily_sync.py's discover_tenants() only syncs orgs that project actually
-# tracks as tenants, not every managed org under the account. Best-effort: RAPID7_MCP_SERVER_DIR
-# unset, or the script itself failing, must not abort this whole cron run (set -e is
-# temporarily relaxed here) -- daily_sync.py's own _load_vm_sync_allowlist falls back to an
-# unfiltered sync if the allowlist file ends up missing/stale, same as before this existed.
-if [ -n "${RAPID7_MCP_SERVER_DIR:-}" ]; then
-  set +e
-  (cd "$RAPID7_MCP_SERVER_DIR" && bun run scripts/export-vm-sync-allowlist.ts)
-  if [ $? -ne 0 ]; then
-    echo "warning: failed to regenerate vm sync allowlist from $RAPID7_MCP_SERVER_DIR -- continuing with existing/unfiltered list" >&2
-  fi
-  set -e
-else
-  echo "warning: RAPID7_MCP_SERVER_DIR not set -- skipping vm sync allowlist regeneration" >&2
-fi
-
 # `uv run` manages this project's own .venv from pyproject.toml/uv.lock (creating it on first
 # run if needed) — portable across hosts, unlike a hardcoded path to one specific machine's venv
 # (this used to point at a sibling workspace's venv on one dev machine and broke immediately on
