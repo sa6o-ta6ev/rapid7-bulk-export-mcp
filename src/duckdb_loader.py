@@ -93,7 +93,7 @@ class VulnerabilityDatabase:
             # Create the file and set permissions; connection is immediately released.
             conn = connect_with_retry(self.db_path)
             conn.close()
-        os.chmod(self.db_path, 0o600)
+            os.chmod(self.db_path, 0o600)
 
     def has_data(self) -> bool:
         """Return True if at least one known table has been loaded."""

@@ -78,6 +78,26 @@ def test_database_initialization():
     db.close()
 
 
+def test_reopening_existing_db_does_not_chmod(tmp_path, monkeypatch):
+    """Opening an already-existing db file must not chmod it.
+
+    Regression test: a reader process that doesn't own the file (e.g. the MCP
+    server running as a different user than whatever created the file) can
+    open/query it fine, but a chmod on a file it doesn't own fails with
+    EPERM ("Operation not permitted") -- so chmod must only happen when this
+    call is the one that created the file.
+    """
+    db_path = str(tmp_path / "existing.db")
+    VulnerabilityDatabase(db_path).close()
+
+    calls = []
+    monkeypatch.setattr("src.duckdb_loader.os.chmod", lambda *a, **k: calls.append(a))
+
+    VulnerabilityDatabase(db_path).close()
+
+    assert calls == []
+
+
 def test_load_parquet_files_by_prefix(sample_parquet_file):
     """Test loading Parquet files into database via prefix routing."""
     db = VulnerabilityDatabase()
