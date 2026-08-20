@@ -423,6 +423,10 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Optional: `python -m src.daily_sync <tenant name or organization_id>` to re-sync just
+    # one tenant (e.g. to backfill one that failed or was missed) instead of the whole fleet.
+    tenant_filter = sys.argv[1] if len(sys.argv) > 1 else None
+
     try:
         tenants = discover_tenants()
     except Exception:
@@ -430,6 +434,17 @@ def main() -> int:
         return 1
 
     logger.info("Discovered %d tenant(s) (including default)", len(tenants))
+
+    if tenant_filter:
+        matched = [
+            t for t in tenants if t["name"].lower() == tenant_filter.lower() or t["organization_id"] == tenant_filter
+        ]
+        if not matched:
+            available = ", ".join(t["name"] for t in tenants)
+            logger.error("No tenant matching %r found. Available tenants: %s", tenant_filter, available)
+            return 1
+        tenants = matched
+        logger.info("Filtered to tenant: %s (organization_id=%r)", tenants[0]["name"], tenants[0]["organization_id"])
 
     results = []
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TENANTS) as executor:
