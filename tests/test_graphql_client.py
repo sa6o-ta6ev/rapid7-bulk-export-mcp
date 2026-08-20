@@ -8,7 +8,14 @@ import pytest
 import requests
 import responses
 
+from src import graphql_client
 from src.graphql_client import send_graphql_request
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    """Retry backoff sleeps are irrelevant to correctness here -- skip the real delay."""
+    monkeypatch.setattr(graphql_client.time, "sleep", lambda seconds: None)
 
 
 class TestSendGraphQLRequest:
@@ -178,3 +185,101 @@ class TestSendGraphQLRequest:
         send_graphql_request(endpoint, api_key, query)
 
         assert responses.calls[0].request.headers["Content-Type"] == "application/json"
+
+
+class TestRetryBehavior:
+    """Test suite for send_graphql_request's retry-on-transient-error behavior."""
+
+    @responses.activate
+    def test_502_then_success_retries_and_returns_result(self):
+        """A transient 502 followed by a 200 should succeed via retry."""
+        endpoint = "https://eu.api.insight.rapid7.com/export/graphql"
+        api_key = "test-api-key"
+        query = "query { test }"
+        expected_response = {"data": {"test": "value"}}
+
+        responses.add(responses.POST, endpoint, status=502)
+        responses.add(responses.POST, endpoint, json=expected_response, status=200)
+
+        result = send_graphql_request(endpoint, api_key, query)
+
+        assert result == expected_response
+        assert len(responses.calls) == 2
+
+    @responses.activate
+    def test_persistent_502_raises_after_max_attempts(self):
+        """A 502 on every attempt should exhaust retries and raise HTTPError."""
+        endpoint = "https://eu.api.insight.rapid7.com/export/graphql"
+        api_key = "test-api-key"
+        query = "query { test }"
+
+        responses.add(responses.POST, endpoint, status=502)
+
+        with pytest.raises(requests.HTTPError) as exc_info:
+            send_graphql_request(endpoint, api_key, query)
+
+        assert "502" in str(exc_info.value)
+        assert len(responses.calls) == graphql_client.GRAPHQL_MAX_ATTEMPTS
+
+    @responses.activate
+    def test_429_is_retried(self):
+        """A 429 rate-limit response should be retried like other transient errors."""
+        endpoint = "https://eu.api.insight.rapid7.com/export/graphql"
+        api_key = "test-api-key"
+        query = "query { test }"
+        expected_response = {"data": {"test": "value"}}
+
+        responses.add(responses.POST, endpoint, status=429)
+        responses.add(responses.POST, endpoint, json=expected_response, status=200)
+
+        result = send_graphql_request(endpoint, api_key, query)
+
+        assert result == expected_response
+        assert len(responses.calls) == 2
+
+    @responses.activate
+    def test_401_is_not_retried(self):
+        """A non-transient 4xx error should raise immediately, without retrying."""
+        endpoint = "https://eu.api.insight.rapid7.com/export/graphql"
+        api_key = "test-api-key"
+        query = "query { test }"
+
+        responses.add(responses.POST, endpoint, json={"error": "Unauthorized"}, status=401)
+
+        with pytest.raises(requests.HTTPError):
+            send_graphql_request(endpoint, api_key, query)
+
+        assert len(responses.calls) == 1
+
+    @responses.activate
+    def test_graphql_level_error_is_not_retried(self):
+        """A 200 response carrying GraphQL errors should raise ValueError immediately."""
+        endpoint = "https://eu.api.insight.rapid7.com/export/graphql"
+        api_key = "test-api-key"
+        query = "query { test }"
+
+        responses.add(
+            responses.POST,
+            endpoint,
+            json={"errors": [{"message": "bad query"}]},
+            status=200,
+        )
+
+        with pytest.raises(ValueError):
+            send_graphql_request(endpoint, api_key, query)
+
+        assert len(responses.calls) == 1
+
+    @responses.activate
+    def test_connection_error_is_retried_then_raises(self):
+        """A persistent ConnectionError should retry up to the max attempts, then raise."""
+        endpoint = "https://eu.api.insight.rapid7.com/export/graphql"
+        api_key = "test-api-key"
+        query = "query { test }"
+
+        responses.add(responses.POST, endpoint, body=requests.exceptions.ConnectionError("boom"))
+
+        with pytest.raises(requests.exceptions.ConnectionError):
+            send_graphql_request(endpoint, api_key, query)
+
+        assert len(responses.calls) == graphql_client.GRAPHQL_MAX_ATTEMPTS

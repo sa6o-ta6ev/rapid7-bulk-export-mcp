@@ -39,6 +39,7 @@ import re
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -77,6 +78,11 @@ REMEDIATION_LOOKBACK_DAYS = 30
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("DAILY_SYNC_POLL_INTERVAL", "30"))
 EXPORT_TIMEOUT_SECONDS = int(os.environ.get("DAILY_SYNC_EXPORT_TIMEOUT", "1800"))
+
+# Tenants are fully independent (separate DuckDB files, separate tracker DBs), so they're
+# synced concurrently. Capped rather than unbounded since every tenant shares the same
+# Rapid7 API key's rate limit.
+MAX_CONCURRENT_TENANTS = int(os.environ.get("DAILY_SYNC_MAX_CONCURRENT_TENANTS", "5"))
 
 # Duplicated from mcp_server.py's _ORG_ID_PATTERN/_org_data_dir rather than
 # imported, so this script has no dependency on the FastMCP server module's
@@ -426,17 +432,24 @@ def main() -> int:
     logger.info("Discovered %d tenant(s) (including default)", len(tenants))
 
     results = []
-    for tenant in tenants:
-        logger.info("Syncing tenant: %s (organization_id=%r)", tenant["name"], tenant["organization_id"])
-        result = sync_one_tenant(tenant)
-        logger.info("Tenant %s: status=%s export_types=%s", tenant["name"], result["status"], result.get("export_types"))
-        results.append(result)
-        # Write after every tenant, not just once at the end -- a full run across many tenants
-        # can take hours, and rapid7-mcp-server's Clients tab should show each tenant's data as
-        # soon as it's ready rather than nothing at all until the entire run finishes (confirmed
-        # live: checking the tab mid-run found no registry file yet). Also means a mid-run crash
-        # still leaves a registry reflecting whatever did complete, not nothing.
-        write_registry_atomically(REGISTRY_PATH, results)
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TENANTS) as executor:
+        futures = {}
+        for tenant in tenants:
+            logger.info("Syncing tenant: %s (organization_id=%r)", tenant["name"], tenant["organization_id"])
+            futures[executor.submit(sync_one_tenant, tenant)] = tenant
+        for future in as_completed(futures):
+            tenant = futures[future]
+            result = future.result()
+            logger.info("Tenant %s: status=%s export_types=%s", tenant["name"], result["status"], result.get("export_types"))
+            results.append(result)
+            # Write after every tenant, not just once at the end -- a full run across many tenants
+            # can take hours, and rapid7-mcp-server's Clients tab should show each tenant's data as
+            # soon as it's ready rather than nothing at all until the entire run finishes (confirmed
+            # live: checking the tab mid-run found no registry file yet). Also means a mid-run crash
+            # still leaves a registry reflecting whatever did complete, not nothing. This write
+            # happens only on the main thread (as each future resolves here), so it's not racing
+            # against other tenants' worker threads.
+            write_registry_atomically(REGISTRY_PATH, results)
 
     logger.info("Registry written to %s", REGISTRY_PATH)
 

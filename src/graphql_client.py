@@ -6,11 +6,23 @@ It provides functionality to send GraphQL queries and mutations with proper
 authentication and error handling.
 """
 
+import logging
+import os
+import time
 from typing import Any, Dict, Optional
 
 import requests
 
 from .config import USER_AGENT
+
+logger = logging.getLogger("graphql_client")
+
+# Transient failures (gateway/server hiccups, rate limiting, network blips) are retried
+# with exponential backoff. Non-transient errors (4xx, GraphQL-level errors) are not --
+# retrying those would just waste time.
+RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
+GRAPHQL_MAX_ATTEMPTS = int(os.environ.get("RAPID7_GRAPHQL_MAX_ATTEMPTS", "4"))
+GRAPHQL_RETRY_BACKOFF_SECONDS = float(os.environ.get("RAPID7_GRAPHQL_RETRY_BACKOFF_SECONDS", "5"))
 
 
 def send_graphql_request(
@@ -64,11 +76,27 @@ def send_graphql_request(
     if variables is not None:
         body["variables"] = variables
 
-    # Send POST request
-    response = requests.post(endpoint, headers=headers, json=body, timeout=30)
+    # Send POST request, retrying transient gateway/network errors with backoff
+    for attempt in range(1, GRAPHQL_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(endpoint, headers=headers, json=body, timeout=30)
+            response.raise_for_status()
+            break
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code in RETRYABLE_STATUS_CODES and attempt < GRAPHQL_MAX_ATTEMPTS:
+                pass
+            else:
+                raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if attempt >= GRAPHQL_MAX_ATTEMPTS:
+                raise
 
-    # Raise HTTPError for non-200 status codes
-    response.raise_for_status()
+        sleep_seconds = GRAPHQL_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+        logger.warning(
+            "GraphQL request to %s failed (attempt %d/%d), retrying in %.0fs",
+            endpoint, attempt, GRAPHQL_MAX_ATTEMPTS, sleep_seconds,
+        )
+        time.sleep(sleep_seconds)
 
     # Parse JSON response
     response_data = response.json()
