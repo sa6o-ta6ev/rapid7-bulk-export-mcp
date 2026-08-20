@@ -16,6 +16,11 @@ services:
       - MCP_TRANSPORT=http
       - DATA_DIR=/data
       - TMPDIR=/tmp
+      # Runs daily_sync in-process on a schedule instead of a separate host
+      # cron job, so every write stays under this container's own uid.
+      - ENABLE_DAILY_SYNC=true
+      - DAILY_SYNC_HOUR_UTC=${DAILY_SYNC_HOUR_UTC:-2}
+      - DAILY_SYNC_MINUTE_UTC=${DAILY_SYNC_MINUTE_UTC:-0}
     volumes:
       - /opt/data/bulk-export:/data
     read_only: true

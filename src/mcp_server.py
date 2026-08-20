@@ -9,11 +9,14 @@ allowing AI assistants to query and analyze the data.
 import datetime as _dt
 import glob
 import json
+import logging
 import os
 import re
 import shutil
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -56,6 +59,44 @@ VALID_EXPORT_TYPES = ("vulnerability", "policy", "remediation", "asset_software"
 # Rapid7 customer/tenant org IDs are UUIDs; keep this permissive but safe for
 # use as a filesystem path segment (no separators, no "..").
 _ORG_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+# Runs daily_sync.main() on a schedule inside this same process/container,
+# instead of relying on a separate host cron job -- keeps every write to
+# DATA_DIR under this image's own uid (no separate host checkout that can
+# drift to a different owner). Opt-in: off by default so `make docker-test`
+# and other one-off container runs never trigger a background sync.
+_ENABLE_DAILY_SYNC = os.environ.get("ENABLE_DAILY_SYNC", "").lower() in ("1", "true", "yes")
+_DAILY_SYNC_HOUR_UTC = int(os.environ.get("DAILY_SYNC_HOUR_UTC", "2"))
+_DAILY_SYNC_MINUTE_UTC = int(os.environ.get("DAILY_SYNC_MINUTE_UTC", "0"))
+
+logger = logging.getLogger("mcp_server")
+
+
+def _seconds_until_next_run(hour: int, minute: int, now: Optional[_dt.datetime] = None) -> float:
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += _dt.timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+def _daily_sync_scheduler_loop() -> None:
+    """Background loop: run daily_sync.main() once every 24h, at a fixed UTC time.
+
+    Runs forever as a daemon thread. A failed run (or one that daily_sync.main()
+    itself reports as "failed") never stops the loop -- it just waits for the
+    next scheduled time and tries again.
+    """
+    from . import daily_sync
+
+    while True:
+        sleep_seconds = _seconds_until_next_run(_DAILY_SYNC_HOUR_UTC, _DAILY_SYNC_MINUTE_UTC)
+        logger.info("Daily sync scheduler: next run in %.0fs", sleep_seconds)
+        time.sleep(sleep_seconds)
+        try:
+            daily_sync.main()
+        except Exception:
+            logger.exception("Scheduled daily sync run raised an unhandled exception")
 
 
 def _org_data_dir(organization_id: Optional[str]) -> Path:
@@ -950,6 +991,13 @@ def main():
 
     # Ensure data directory exists
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    if _ENABLE_DAILY_SYNC:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
+        logger.info(
+            "Daily sync scheduler enabled: runs at %02d:%02d UTC", _DAILY_SYNC_HOUR_UTC, _DAILY_SYNC_MINUTE_UTC
+        )
+        threading.Thread(target=_daily_sync_scheduler_loop, name="daily-sync-scheduler", daemon=True).start()
 
     # Stash the CLI override for the default org's database path — applied
     # lazily the first time it's actually needed, since databases now
