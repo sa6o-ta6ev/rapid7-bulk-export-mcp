@@ -1,8 +1,9 @@
 """Unattended daily sync of Rapid7 InsightVM Bulk Export data.
 
-Run from cron (see scripts/run-daily-sync.sh), not through Claude/MCP tool
-calls: no FastMCP runtime dependency, plain function calls into the same
-building blocks mcp_server.py's interactive tools use
+Run in-process by mcp_server.py's daily-sync scheduler thread (see
+ENABLE_DAILY_SYNC), not through Claude/MCP tool calls: no FastMCP runtime
+dependency, plain function calls into the same building blocks
+mcp_server.py's interactive tools use
 (config/export_manager/download/duckdb_loader/export_tracker/
 organizations_client).
 
