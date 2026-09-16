@@ -17,6 +17,8 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
+import uuid
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -28,12 +30,14 @@ from .config import load_config, load_parent_organization_config
 from .download import download_all_files
 from .duckdb_loader import VulnerabilityDatabase
 from .export_manager import (
+    ExportInProgressError,
     build_remediation_date_chunks,
     create_asset_software_export,
     create_policy_export,
     create_remediation_export,
     create_vulnerability_export,
     get_export_status,
+    poll_until_complete,
 )
 from .export_tracker import DEFAULT_ORG_ID, ExportTracker
 from .organizations_client import filter_by_region, get_managed_organizations
@@ -46,19 +50,91 @@ mcp = FastMCP("rapid7-bulk-export")
 # this preserves today's exact behavior and paths.
 _db_instances: Dict[str, VulnerabilityDatabase] = {}
 
+# Org-keyed locks guarding each tenant's database connection (both a
+# background load and the read tools below), so a query can never run
+# concurrently with that same tenant's tables being dropped/recreated
+# mid-load. Re-entrant so a locked section can safely call another helper
+# that also acquires it. Per-org (not global) so a background load for one
+# tenant never blocks reads/loads for an unrelated tenant — daily_sync.py
+# already relies on tenants being independent and syncs them concurrently.
+_db_locks: Dict[str, threading.RLock] = {}
+_db_locks_meta_lock = threading.Lock()
+
+
+def _get_db_lock(organization_id: str = "") -> threading.RLock:
+    """Lazily get or create the per-tenant RLock guarding that tenant's db."""
+    key = organization_id or DEFAULT_ORG_ID
+    with _db_locks_meta_lock:
+        if key not in _db_locks:
+            _db_locks[key] = threading.RLock()
+        return _db_locks[key]
+
 # CLI positional arg override for the default org's database path, captured
 # in main() and applied lazily the first time the default db is requested.
 _default_db_path_override: Optional[str] = None
 
 # Data directory — resolved once at startup, used for all database paths.
-# Defaults to ~/.rapid7_mcp so relative-path writes never hit a read-only CWD.
-_DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "~/.rapid7_mcp")).expanduser().resolve()
+# Precedence: explicit DATA_DIR wins (existing installs unaffected), then the
+# plugin host's PLUGIN_DATA (Agent Plugins spec: per-install, writable, survives
+# updates), then ~/.rapid7_mcp so relative-path writes never hit a read-only CWD.
+_DATA_DIR: Path = (
+    Path(os.environ.get("DATA_DIR") or os.environ.get("PLUGIN_DATA") or "~/.rapid7_mcp").expanduser().resolve()
+)
 
 VALID_EXPORT_TYPES = ("vulnerability", "policy", "remediation", "asset_software")
 
 # Rapid7 customer/tenant org IDs are UUIDs; keep this permissive but safe for
 # use as a filesystem path segment (no separators, no "..").
 _ORG_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+# ---------------------------------------------------------------------------
+# Background download/load job tracking
+#
+# Loading a full export (potentially millions of rows) can take much longer
+# than an MCP client's tool-call timeout — Claude Desktop, for example,
+# hard-cancels a tool call after ~4 minutes. Running the download+load
+# synchronously inside a single tool call means the client gives up and
+# cancels while the server keeps working, and when the server later tries
+# to respond to that already-cancelled request, some MCP client/session
+# implementations raise on a duplicate response and crash the whole stdio
+# server process.
+#
+# To avoid this, download_rapid7_export() only *starts* the work in a
+# background thread and returns immediately. Progress and results are
+# recorded as phase transitions on the durable ExportTracker row (not an
+# in-memory dict), so state is durable and inspectable after a restart and is
+# reported by the existing check_rapid7_export_status() and list_rapid7_exports()
+# tools — there is no separate status tool to poll. Workers do not resume across
+# a restart; interrupted work is reconciled to a retryable FAILED at startup.
+#
+# All of this is per-tenant: each background worker carries organization_id
+# through to _get_db/_tracker/_get_db_lock, so one tenant's load never blocks
+# or corrupts another tenant's database.
+# ---------------------------------------------------------------------------
+
+# Local load-phase values written to the tracker's `status` column. These
+# describe THIS server's download+load progress, distinct from the Rapid7
+# platform-side export status returned by the API (PENDING/PROCESSING/…).
+PHASE_DOWNLOADING = "DOWNLOADING"
+PHASE_LOADING = "LOADING"
+PHASE_COMPLETE = "COMPLETE"  # data loaded locally and queryable
+PHASE_FAILED = "FAILED"
+
+# States that mean a background load is actively touching the database, so a
+# second download must not start and reads should back off.
+_ACTIVE_PHASES = (PHASE_DOWNLOADING, PHASE_LOADING)
+
+# Multi-chunk job status values (export_jobs.status). A job spans N per-chunk
+# export IDs; these describe the job as a whole.
+JOB_RUNNING = "RUNNING"
+JOB_COMPLETE = "COMPLETE"
+JOB_FAILED = "FAILED"  # at least one chunk failed; loaded chunks remain
+
+# How long to wait between retries when the platform reports another export of
+# the same type already in flight, and how long to keep retrying before giving
+# up on a chunk.
+_IN_PROGRESS_RETRY_SECS = 30
+_IN_PROGRESS_MAX_WAIT_SECS = 20 * 60
 
 # Runs daily_sync.main() on a schedule inside this same process/container,
 # instead of relying on a separate host cron job -- keeps every write to
@@ -135,6 +211,11 @@ def _get_db(organization_id: str = "") -> VulnerabilityDatabase:
     return _db_instances[key]
 
 
+def _tracker(organization_id: str = "") -> ExportTracker:
+    """Open a tracker handle on the given tenant's tracking database."""
+    return ExportTracker(str(_org_data_dir(organization_id) / "rapid7_bulk_export_tracking.db"))
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Load Rapid7 Parquet File",
@@ -186,35 +267,44 @@ def load_rapid7_parquet(parquet_path: str, organization_id: str = "") -> str:
         if not parquet_files:
             return f"✗ Error: No Parquet files found at: {resolved}"
 
-        db = _get_db(organization_id)
+        if not _get_db_lock(organization_id).acquire(blocking=False):
+            return (
+                "⏳ A background download/load is currently in progress for this "
+                "tenant. Try again shortly, or check "
+                "check_rapid7_export_status(export_id=..., organization_id=...) for progress."
+            )
+        try:
+            db = _get_db(organization_id)
 
-        # Detect file types by peeking at schema and build prefix map
-        prefix_file_map: dict = {}
-        for pf in parquet_files:
-            try:
-                cols = [
-                    desc[0]
-                    for desc in _duckdb.execute(
-                        f"SELECT * FROM read_parquet('{pf}') LIMIT 0"  # nosec B608
-                    ).description
-                ]
-                if "vulnId" in cols or "checkId" in cols:
-                    prefix_file_map.setdefault("asset_vulnerability", []).append(pf)
-                else:
-                    prefix_file_map.setdefault("asset", []).append(pf)
-            except Exception:
-                # If we can't determine type, skip the file
-                continue
+            # Detect file types by peeking at schema and build prefix map
+            prefix_file_map: dict = {}
+            for pf in parquet_files:
+                try:
+                    cols = [
+                        desc[0]
+                        for desc in _duckdb.execute(
+                            f"SELECT * FROM read_parquet('{pf}') LIMIT 0"  # nosec B608
+                        ).description
+                    ]
+                    if "vulnId" in cols or "checkId" in cols:
+                        prefix_file_map.setdefault("asset_vulnerability", []).append(pf)
+                    else:
+                        prefix_file_map.setdefault("asset", []).append(pf)
+                except Exception:
+                    # If we can't determine type, skip the file
+                    continue
 
-        if not prefix_file_map:
-            return f"✗ Error: Could not determine schema for any Parquet files at: {resolved}"
+            if not prefix_file_map:
+                return f"✗ Error: Could not determine schema for any Parquet files at: {resolved}"
 
-        # Load into database
-        row_counts = db.load_parquet_files_by_prefix(prefix_file_map)
-        row_count = sum(row_counts.values())
+            # Load into database
+            row_counts = db.load_parquet_files_by_prefix(prefix_file_map)
+            row_count = sum(row_counts.values())
 
-        # Get statistics
-        stats = db.get_stats()
+            # Get statistics
+            stats = db.get_stats()
+        finally:
+            _get_db_lock(organization_id).release()
 
         return (
             f"✓ Successfully loaded {row_count} rows from {len(parquet_files)} file(s).\n\n"
@@ -348,37 +438,48 @@ def start_rapid7_export(
             if not end_date:
                 end_date = _dt.date.today().isoformat()
 
-            chunks = build_remediation_date_chunks(start_date, end_date)
-
-            export_ids = []
-            for chunk_start, chunk_end in chunks:
-                print(f"Creating remediation export: {chunk_start} → {chunk_end}", file=sys.stderr)
-                eid = create_remediation_export(config, chunk_start, chunk_end)
-                export_ids.append({"id": eid, "start": chunk_start, "end": chunk_end})
-                tracker.save_export(
-                    export_id=eid,
-                    status="PENDING",
-                    parquet_urls=[],
-                    export_type="remediation",
-                    organization_id=org_key,
+            # Idempotency: this MCP tool may be retried. A remediation job
+            # appends its windows, so starting a second job for the SAME range
+            # would double the rows. Reuse an existing job for the exact range —
+            # report progress if it's still RUNNING, or its stored result if
+            # COMPLETE — and only start a fresh job when none exists or the
+            # prior one FAILED (an intended retry).
+            existing = tracker.find_job_by_range("remediation", start_date, end_date)
+            if existing is not None and existing.get("status") in (JOB_RUNNING, JOB_COMPLETE):
+                tracker.close()
+                jid = existing["job_id"]
+                if existing["status"] == JOB_COMPLETE:
+                    return (
+                        f"♻️ Remediation data for {start_date} → {end_date} is already loaded "
+                        f"(job {jid}). Not re-running (that would duplicate rows).\n\n"
+                        f'See results with: check_rapid7_export_status(export_id="{jid}")'
+                    )
+                return (
+                    f"⏳ A remediation load for {start_date} → {end_date} is already in progress "
+                    f"(job {jid}).\n\n"
+                    f'Check progress with: check_rapid7_export_status(export_id="{jid}")'
                 )
+
+            # A remediation range may span multiple ≤31-day windows, and the
+            # platform allows only one remediation export in flight at a time.
+            # Hand the whole range to a single background job that creates,
+            # polls, downloads, and loads each window sequentially and appends
+            # them into vulnerability_remediation. The caller polls one job id.
             tracker.close()
+            chunk_ranges = build_remediation_date_chunks(start_date, end_date)
+            job_id = _start_remediation_job(start_date, end_date, organization_id)
 
-            lines = [
-                f"✓ Created {len(export_ids)} remediation export(s) covering {start_date} → {end_date}.\n",
-            ]
-            for i, info in enumerate(export_ids, 1):
-                lines.append(f"  {i}. {info['start']} → {info['end']}  Export ID: {info['id']}")
-
-            lines.append("")
-            lines.append("Each export takes ~3-5 minutes to process.")
-            lines.append('Check progress with: check_rapid7_export_status(export_id="...")')
-            lines.append(
-                'Once COMPLETE, load each with: download_rapid7_export(export_id="...", export_type="remediation")'
+            return (
+                f"▶️ Started loading remediation data for {start_date} → {end_date} "
+                f"in the background.\n\n"
+                f"Job ID: {job_id}\n"
+                f"Windows: {len(chunk_ranges)} (each ≤31 days, loaded sequentially)\n\n"
+                f"The platform allows only one remediation export at a time, so windows "
+                f"are processed one after another; this can take several minutes each.\n"
+                f"All windows append into the same vulnerability_remediation table.\n\n"
+                f"Check progress with: "
+                f'check_rapid7_export_status(export_id="{job_id}")'
             )
-            lines.append("All chunks load into the same vulnerability_remediation table.")
-
-            return "\n".join(lines)
 
         elif export_type == "asset_software":
             new_id = create_asset_software_export(config)
@@ -417,20 +518,68 @@ def start_rapid7_export(
     )
 )
 def check_rapid7_export_status(export_id: str, organization_id: str = "") -> str:
-    """Check the current status of a Rapid7 export job.
+    """Check the status of a Rapid7 export, including local download/load progress.
 
-    This is a fast, non-blocking call that queries the Rapid7 API once
-    and returns the current status. Does NOT poll or wait.
+    Fast, non-blocking call. Reports whichever stage the export is in:
+
+      - While this server is downloading or loading the export in the
+        background, reports that local phase and per-file progress — and
+        skips the Rapid7 API call, since the platform-side export is
+        already known to be complete.
+      - Once loaded (COMPLETE) or failed (FAILED) locally, returns the
+        stored summary/error so no work is repeated.
+      - Otherwise queries the Rapid7 API once for the platform-side export
+        status (PENDING/PROCESSING/COMPLETE/FAILED).
+
+    Because local phase lives in the durable tracker, it is inspectable after
+    a server restart (interrupted work is reconciled to a retryable FAILED at
+    startup rather than resumed). Does NOT poll or wait.
 
     Args:
-        export_id: The export ID returned by start_rapid7_export.
+        export_id: The export ID returned by start_rapid7_export, or a
+            job ID returned by a multi-window remediation load.
         organization_id: Optional Rapid7 customer/tenant org ID — pass the
             same value used in start_rapid7_export for this export, if any.
 
     Returns:
-        Current export status and next steps.
+        Current export/load status and next steps.
     """
     try:
+        # A multi-window remediation load is tracked as a job spanning N export
+        # IDs; if the id names a job, report the job's progress.
+        tracker = _tracker(organization_id)
+        job = tracker.get_job(export_id)
+        if job is not None:
+            tracker.close()
+            return _format_job_status(job)
+
+        # Local load phase takes precedence: if a background download/load is
+        # active or has reached a terminal state, report that and skip the
+        # (now-redundant) platform-side status call.
+        local = tracker.get_export_by_id(export_id)
+        tracker.close()
+
+        if local is not None:
+            local_status = local.get("status")
+
+            if local_status == PHASE_COMPLETE:
+                return local.get("message") or (
+                    f"✓ Data loaded and queryable.\n\nExport ID: {export_id}\nRows: {local.get('row_count')}"
+                )
+            if local_status == PHASE_FAILED:
+                return local.get("message") or f"✗ Download/load failed.\n\nExport ID: {export_id}"
+            if local_status in _ACTIVE_PHASES:
+                detail = local.get("phase_detail")
+                detail_line = f"\n{detail}" if detail else ""
+                return (
+                    f"⏳ Downloading/loading in progress locally ({local_status}).{detail_line}\n\n"
+                    f"Export ID: {export_id}\n"
+                    f"Last update: {local.get('updated_at') or local.get('created_at', 'unknown')}\n\n"
+                    f"Check again in 30-60 seconds with: "
+                    f'check_rapid7_export_status(export_id="{export_id}")'
+                )
+            # PENDING or any other value falls through to the platform-side check.
+
         config = load_config(organization_id or None)
         status_info = get_export_status(config, export_id)
         current_status = status_info["status"]
@@ -438,7 +587,7 @@ def check_rapid7_export_status(export_id: str, organization_id: str = "") -> str
 
         if current_status in ["COMPLETE", "SUCCEEDED"]:
             return (
-                f"✓ Export is complete.\n\n"
+                f"✓ Export is complete on Rapid7's side and ready to download.\n\n"
                 f"Export ID: {export_id}\n"
                 f"Status: {current_status}\n"
                 f"Files ready: {file_count}\n\n"
@@ -468,6 +617,297 @@ def check_rapid7_export_status(export_id: str, organization_id: str = "") -> str
         return f"✗ Error checking export status: {str(e)}"
 
 
+def _download_and_load_files(
+    export_type: str,
+    status_info: dict,
+    api_key: str,
+    organization_id: str = "",
+    on_downloaded=None,
+) -> tuple:
+    """Download an export's parquet files and load them into DuckDB.
+
+    Shared by the single-export worker and the multi-chunk remediation
+    orchestrator so the download/route/load path is not forked. Acquires
+    the given tenant's db lock around the load. If provided, on_downloaded()
+    is called once the files are actually downloaded and before the load
+    begins, so a caller can record the LOADING phase honestly. Returns
+    (row_count, row_counts, stats, validation_warnings).
+    """
+    parquet_urls = status_info["parquetFiles"]
+    file_data = download_all_files(parquet_urls, api_key, organization_id=organization_id or None)
+    if on_downloaded is not None:
+        on_downloaded()
+
+    temp_dir = tempfile.mkdtemp()
+    validation_warnings: list = []
+    try:
+        with _get_db_lock(organization_id):
+            db = _get_db(organization_id)
+
+            result_list = status_info.get("result") or []
+            url_to_prefix = {}
+            for item in result_list:
+                prefix = item.get("prefix", "")
+                for url in item.get("urls", []):
+                    url_to_prefix[url] = prefix
+
+            prefix_file_map: dict = {}
+            for i, (url, data) in enumerate(zip(parquet_urls, file_data)):
+                temp_path = Path(temp_dir) / f"{export_type}_export_{i}.parquet"
+                temp_path.write_bytes(data)
+                prefix = url_to_prefix.get(url, "unknown")
+                prefix_file_map.setdefault(prefix, []).append(str(temp_path))
+                if len(data) < 100:
+                    validation_warnings.append(f"File {i + 1} (prefix={prefix}): unusually small ({len(data)} bytes)")
+
+            if export_type == "policy":
+                row_counts = db.load_parquet_files_by_prefix(prefix_file_map, skip_prefixes={"asset"})
+            elif export_type == "remediation":
+                row_counts = db.load_parquet_files_by_prefix(prefix_file_map, append=True)
+            else:
+                row_counts = db.load_parquet_files_by_prefix(prefix_file_map)
+
+            row_count = sum(row_counts.values())
+            if row_count == 0 and len(file_data) > 0:
+                validation_warnings.append(
+                    f"⚠️  {len(file_data)} file(s) downloaded but 0 rows loaded. "
+                    f"Prefixes received: {list(prefix_file_map.keys())}. "
+                    f"Check that prefixes match expected routing."
+                )
+
+            stats = db.get_stats()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return row_count, row_counts, stats, validation_warnings
+
+
+def _run_download_and_load(export_id: str, export_type: str, organization_id: str = "") -> None:
+    """Background worker: download parquet files and load them into DuckDB.
+
+    Runs in its own thread. All progress/results are written to the
+    ExportTracker row for this export_id rather than returned, since
+    nothing is waiting on a function return here. Any exception is caught
+    and recorded as a FAILED phase (with the error text) so the status
+    tools can report it, instead of the process crashing on a late/
+    duplicate response the way the synchronous version could when a client
+    had already timed out and cancelled the request.
+    """
+    tracker = _tracker(organization_id)
+    try:
+        config = load_config(organization_id or None)
+        status_info = get_export_status(config, export_id)
+        parquet_urls = status_info["parquetFiles"]
+
+        tracker.set_phase(
+            export_id,
+            PHASE_DOWNLOADING,
+            phase_detail=f"downloading {len(parquet_urls)} file(s)",
+        )
+        print(f"Downloading {len(parquet_urls)} {export_type} files...", file=sys.stderr)
+
+        def _mark_loading() -> None:
+            tracker.set_phase(
+                export_id,
+                PHASE_LOADING,
+                phase_detail=f"{len(parquet_urls)} file(s) downloaded, loading into database",
+            )
+
+        row_count, row_counts, stats, validation_warnings = _download_and_load_files(
+            export_type, status_info, config["api_key"], organization_id=organization_id, on_downloaded=_mark_loading
+        )
+        row_info = f"Rows loaded: {row_count}\nPer-table row counts: {json.dumps(row_counts, default=str)}"
+
+        warnings_section = ""
+        if validation_warnings:
+            warnings_section = "\nValidation Warnings:\n" + "\n".join(f"  {w}" for w in validation_warnings) + "\n"
+
+        message = (
+            f"✓ {export_type.capitalize()} data loaded successfully.\n\n"
+            f"Export ID: {export_id}\n"
+            f"Files processed: {len(parquet_urls)}\n"
+            f"{row_info}\n"
+            f"{warnings_section}\n"
+            f"Statistics:\n"
+            f"{json.dumps(stats, indent=2, default=str)}\n\n"
+            f"Query the data with query_rapid7, get_rapid7_schema, or get_rapid7_stats."
+        )
+        # Record the completed load with its parquet URLs and final row count.
+        tracker.save_export(
+            export_id=export_id,
+            status=PHASE_COMPLETE,
+            parquet_urls=parquet_urls,
+            row_count=row_count,
+            export_type=export_type,
+            organization_id=organization_id or DEFAULT_ORG_ID,
+        )
+        tracker.set_phase(export_id, PHASE_COMPLETE, phase_detail=None, message=message, row_count=row_count)
+
+    except Exception as e:
+        error_text = f"{e}\n{traceback.format_exc()}"
+        message = (
+            f"✗ Error downloading/loading {export_type}: {str(e)}\n\n"
+            f"Export ID: {export_id}\n"
+            f"Retry with: download_rapid7_export("
+            f'export_id="{export_id}", '
+            f'export_type="{export_type}")\n\n'
+            f"{error_text}"
+        )
+        tracker.set_phase(export_id, PHASE_FAILED, phase_detail=None, message=message)
+    finally:
+        tracker.close()
+
+
+def _create_remediation_chunk_waiting(config: dict, chunk_start: str, chunk_end: str) -> str:
+    """Create one remediation chunk, waiting out any foreign in-flight export.
+
+    The platform permits only one remediation export in flight at a time. If
+    another is running (this job's previous chunk, or an unrelated export),
+    create is rejected with ExportInProgressError. We must NOT adopt that
+    foreign id — it may cover a different date range — so we back off and
+    recreate THIS chunk's own range until the platform frees up.
+    """
+    deadline = time.monotonic() + _IN_PROGRESS_MAX_WAIT_SECS
+    while True:
+        try:
+            return create_remediation_export(config, chunk_start, chunk_end)
+        except ExportInProgressError:
+            if time.monotonic() >= deadline:
+                raise
+            print(
+                f"Remediation export slot busy; waiting to create {chunk_start} → {chunk_end}...",
+                file=sys.stderr,
+            )
+            time.sleep(_IN_PROGRESS_RETRY_SECS)
+
+
+def _run_remediation_job(job_id: str, chunks: list, organization_id: str = "") -> None:
+    """Background worker: load a multi-window remediation range as one job.
+
+    Processes each ≤31-day window strictly sequentially (create → poll →
+    download → load append), because the platform serialises remediation
+    exports anyway. Per-chunk outcome is persisted on the export_jobs row so a
+    partial failure names exactly which windows loaded and which did not.
+    """
+    tracker = _tracker(organization_id)
+    try:
+        config = load_config(organization_id or None)
+        total = len(chunks)
+        total_rows = 0
+
+        for i, chunk in enumerate(chunks):
+            cs, ce = chunk["start"], chunk["end"]
+            window = f"{cs} → {ce}"
+
+            def _mark(state: str) -> None:
+                chunks[i]["status"] = state
+                tracker.update_job(
+                    job_id,
+                    current_index=i,
+                    chunks=chunks,
+                    message=f"chunk {i + 1}/{total} ({window}), {state}",
+                )
+
+            _mark("creating")
+            eid = _create_remediation_chunk_waiting(config, cs, ce)
+            chunks[i]["export_id"] = eid
+
+            _mark("waiting for export")
+            parquet_urls = poll_until_complete(config, eid)
+            status_info = get_export_status(config, eid)
+            if not parquet_urls:
+                status_info["parquetFiles"] = status_info.get("parquetFiles", [])
+
+            row_count, _, _, _ = _download_and_load_files(
+                "remediation",
+                status_info,
+                config["api_key"],
+                organization_id=organization_id,
+                on_downloaded=lambda: _mark("loading"),
+            )
+            # Mark loaded the instant the append has committed, BEFORE any
+            # further tracker writes. If save_export below throws, the window
+            # is already recorded loaded so the failure report can never tell
+            # the user to re-run a window whose rows are already present.
+            total_rows += row_count
+            chunks[i]["row_count"] = row_count
+            _mark("loaded")
+            tracker.save_export(
+                export_id=eid,
+                status=PHASE_COMPLETE,
+                parquet_urls=parquet_urls,
+                row_count=row_count,
+                export_type="remediation",
+                organization_id=organization_id or DEFAULT_ORG_ID,
+            )
+
+        loaded = [f"{c['start']} → {c['end']} ({c.get('row_count', 0)} rows)" for c in chunks]
+        message = (
+            f"✓ Remediation data loaded for all {total} window(s).\n\n"
+            f"Total rows: {total_rows}\n"
+            f"Windows loaded:\n" + "\n".join(f"  {w}" for w in loaded) + "\n\n"
+            "Query the data with query_rapid7, get_rapid7_schema, or get_rapid7_stats."
+        )
+        tracker.update_job(job_id, status=JOB_COMPLETE, current_index=total - 1, chunks=chunks, message=message)
+
+    except Exception as e:
+        error_text = f"{e}\n{traceback.format_exc()}"
+        loaded = [f"{c['start']} → {c['end']}" for c in chunks if c.get("status") == "loaded"]
+        missing = [f"{c['start']} → {c['end']}" for c in chunks if c.get("status") != "loaded"]
+        message = (
+            f"✗ Remediation load failed partway through.\n\n"
+            f"Loaded windows (kept): {', '.join(loaded) or 'none'}\n"
+            f"Missing windows: {', '.join(missing) or 'none'}\n\n"
+            f"Re-run only the missing range with start_rapid7_export("
+            f'export_type="remediation", start_date="...", end_date="...").\n\n'
+            f"{error_text}"
+        )
+        tracker.update_job(job_id, status=JOB_FAILED, chunks=chunks, message=message)
+    finally:
+        tracker.close()
+
+
+def _start_remediation_job(start_date: str, end_date: str, organization_id: str = "") -> str:
+    """Create and launch a multi-window remediation load job. Returns the job_id."""
+    chunk_ranges = build_remediation_date_chunks(start_date, end_date)
+    chunks = [{"start": cs, "end": ce, "export_id": None, "status": "pending"} for cs, ce in chunk_ranges]
+
+    job_id = f"remediation-{uuid.uuid4().hex[:12]}"
+    tracker = _tracker(organization_id)
+    tracker.create_job(
+        job_id=job_id,
+        export_type="remediation",
+        start_date=start_date,
+        end_date=end_date,
+        chunks=chunks,
+        status=JOB_RUNNING,
+    )
+    tracker.close()
+
+    thread = threading.Thread(target=_run_remediation_job, args=(job_id, chunks, organization_id), daemon=True)
+    thread.start()
+    return job_id
+
+
+def _format_job_status(job: dict) -> str:
+    """Render an export_jobs row for check_rapid7_export_status."""
+    status = job.get("status")
+    if status == JOB_COMPLETE:
+        return job.get("message") or f"✓ Remediation job {job['job_id']} complete."
+    if status == JOB_FAILED:
+        return job.get("message") or f"✗ Remediation job {job['job_id']} failed."
+
+    total = len(job.get("chunks") or [])
+    return (
+        f"⏳ Remediation load in progress.\n\n"
+        f"Job ID: {job['job_id']}\n"
+        f"Range: {job.get('start_date')} → {job.get('end_date')} ({total} window(s))\n"
+        f"{job.get('message', '')}\n\n"
+        f"Check again in 30-60 seconds with: "
+        f'check_rapid7_export_status(export_id="{job["job_id"]}")'
+    )
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Download Rapid7 Export",
@@ -478,23 +918,26 @@ def check_rapid7_export_status(export_id: str, organization_id: str = "") -> str
     )
 )
 def download_rapid7_export(export_id: str, export_type: str = "vulnerability", organization_id: str = "") -> str:
-    """Download a completed Rapid7 export and load into the database.
+    """Start downloading a completed Rapid7 export and loading it into the database.
 
     Call this after check_rapid7_export_status confirms the export is COMPLETE.
-    Downloads the Parquet files and loads them into the local DuckDB
-    database for querying.
+    This kicks off the download and load in the background and returns
+    immediately — large exports (potentially millions of rows) can take
+    several minutes to load, longer than most MCP clients will wait on a
+    single tool call. Poll progress with check_rapid7_export_status(export_id).
 
     Args:
         export_id: The export ID of a completed export.
         export_type: Type of export. One of "vulnerability", "policy",
-                     or "remediation".
+                     "remediation", or "asset_software".
         organization_id: Optional Rapid7 customer/tenant org ID — pass the
             same value used in start_rapid7_export for this export, if any.
             Loads into that tenant's isolated cache under
             DATA_DIR/orgs/<organization_id>/.
 
     Returns:
-        Summary of loaded data including row counts and statistics.
+        Confirmation that the background job has started, plus how to
+        check on it.
     """
     if export_type not in VALID_EXPORT_TYPES:
         return f"✗ Invalid export_type: '{export_type}'. Valid values are: {', '.join(VALID_EXPORT_TYPES)}"
@@ -502,7 +945,7 @@ def download_rapid7_export(export_id: str, export_type: str = "vulnerability", o
     try:
         config = load_config(organization_id or None)
 
-        # Verify export is complete
+        # Quick call — just confirms the export is ready, doesn't download anything.
         status_info = get_export_status(config, export_id)
         current_status = status_info["status"]
 
@@ -516,95 +959,57 @@ def download_rapid7_export(export_id: str, export_type: str = "vulnerability", o
                 f'export_id="{export_id}")'
             )
 
-        parquet_urls = status_info["parquetFiles"]
-        if not parquet_urls:
+        if not status_info["parquetFiles"]:
             return f"✗ Export complete but has no files.\n\nExport ID: {export_id}"
 
-        # Download files
-        print(f"Downloading {len(parquet_urls)} {export_type} files...", file=sys.stderr)
-        file_data = download_all_files(parquet_urls, config["api_key"], organization_id=organization_id or None)
-
-        db = _get_db(organization_id)
-
-        temp_dir = tempfile.mkdtemp()
-        validation_warnings = []
-
-        try:
-            # All export types use prefix-based routing from the API response
-            result_list = status_info.get("result") or []
-
-            url_to_prefix = {}
-            for item in result_list:
-                prefix = item.get("prefix", "")
-                for url in item.get("urls", []):
-                    url_to_prefix[url] = prefix
-
-            prefix_file_map = {}
-            for i, (url, data) in enumerate(zip(parquet_urls, file_data)):
-                temp_path = Path(temp_dir) / f"{export_type}_export_{i}.parquet"
-                temp_path.write_bytes(data)
-                prefix = url_to_prefix.get(url, "unknown")
-                prefix_file_map.setdefault(prefix, []).append(str(temp_path))
-                # Validate file has content
-                if len(data) < 100:
-                    validation_warnings.append(f"File {i + 1} (prefix={prefix}): unusually small ({len(data)} bytes)")
-
-            if export_type == "policy":
-                row_counts = db.load_parquet_files_by_prefix(prefix_file_map, skip_prefixes={"asset"})
-            elif export_type == "remediation":
-                row_counts = db.load_parquet_files_by_prefix(prefix_file_map, append=True)
-            else:
-                row_counts = db.load_parquet_files_by_prefix(prefix_file_map)
-
-            row_count = sum(row_counts.values())
-            row_info = f"Rows loaded: {row_count}\nPer-table row counts: {json.dumps(row_counts, default=str)}"
-
-            if row_count == 0 and len(file_data) > 0:
-                validation_warnings.append(
-                    f"⚠️  {len(file_data)} file(s) downloaded but 0 rows loaded. "
-                    f"Prefixes received: {list(prefix_file_map.keys())}. "
-                    f"Check that prefixes match expected routing."
-                )
-
-            # Save export metadata
-            tracker = ExportTracker(str(_org_data_dir(organization_id) / "rapid7_bulk_export_tracking.db"))
-            tracker.save_export(
-                export_id=export_id,
-                status="COMPLETE",
-                parquet_urls=parquet_urls,
-                row_count=row_count,
-                export_type=export_type,
-                organization_id=organization_id or DEFAULT_ORG_ID,
-            )
+        # Don't start a second job for the same export if one's already running.
+        tracker = _tracker(organization_id)
+        existing = tracker.get_export_by_id(export_id)
+        if existing is not None and existing.get("status") in _ACTIVE_PHASES:
             tracker.close()
+            return (
+                f"⏳ A download for this export is already in progress "
+                f"(status: {existing['status']}).\n\n"
+                f"Export ID: {export_id}\n"
+                f'Check progress with: check_rapid7_export_status(export_id="{export_id}")'
+            )
 
-            # Get statistics
-            stats = db.get_stats()
+        # Record the initial phase durably. The row usually already exists at
+        # PENDING (start_rapid7_export inserts it); save_export upserts so a
+        # directly-supplied export_id is tracked too.
+        parquet_urls = status_info["parquetFiles"]
+        tracker.save_export(
+            export_id=export_id,
+            status=PHASE_DOWNLOADING,
+            parquet_urls=parquet_urls,
+            export_type=export_type,
+            organization_id=organization_id or DEFAULT_ORG_ID,
+        )
+        tracker.set_phase(
+            export_id,
+            PHASE_DOWNLOADING,
+            phase_detail=f"queued: {len(parquet_urls)} file(s) to download",
+        )
+        tracker.close()
 
-        finally:
-            # Clean up temp files
-            shutil.rmtree(temp_dir)
-
-        # Build validation warnings section
-        warnings_section = ""
-        if validation_warnings:
-            warnings_section = "\nValidation Warnings:\n" + "\n".join(f"  {w}" for w in validation_warnings) + "\n"
+        thread = threading.Thread(
+            target=_run_download_and_load,
+            args=(export_id, export_type, organization_id),
+            daemon=True,
+        )
+        thread.start()
 
         return (
-            f"✓ {export_type.capitalize()} data loaded successfully.\n\n"
+            f"▶️ Started downloading and loading {export_type} export in the background.\n\n"
             f"Export ID: {export_id}\n"
-            f"Files processed: {len(parquet_urls)}\n"
-            f"{row_info}\n"
-            f"{warnings_section}\n"
-            f"Statistics:\n"
-            f"{json.dumps(stats, indent=2, default=str)}\n\n"
-            f"Query the data with query_rapid7, "
-            f"get_rapid7_schema, or get_rapid7_stats."
+            f"Files: {len(parquet_urls)}\n\n"
+            f"This can take several minutes for large exports. Check progress with:\n"
+            f'check_rapid7_export_status(export_id="{export_id}")'
         )
 
     except Exception as e:
         return (
-            f"✗ Error downloading/loading {export_type}: {str(e)}\n\n"
+            f"✗ Error starting download for {export_type}: {str(e)}\n\n"
             f"Export ID: {export_id}\n"
             f"Retry with: download_rapid7_export("
             f'export_id="{export_id}", '
@@ -638,6 +1043,10 @@ def query_rapid7(sql: str, organization_id: str = "") -> str:
       cvssV3Severity, hasExploits, epssscore, epsspercentile, riskScoreV2_0,
       cves, firstFoundTimestamp, reintroducedTimestamp, dateAdded,
       dateModified, datePublished, pciCompliant, pciSeverity
+
+    **vulnerability_exceptions** — Vulnerability exceptions (waived/accepted risk):
+      Key fields: orgId, assetId, vulnId, checkId, key, port, protocol,
+      nic, proof, firstFoundTimestamp, reintroducedTimestamp, exceptionDetails
 
     **policies** — Policy compliance results (agent and scan based):
       Key fields: orgId, assetId, benchmarkNaturalId, profileNaturalId,
@@ -678,15 +1087,27 @@ def query_rapid7(sql: str, organization_id: str = "") -> str:
     """
     db = _get_db(organization_id)
 
-    if not db.has_data():
-        return "Error: No data loaded. Please run start_rapid7_export and download_rapid7_export first."
-
+    # Acquire this tenant's lock BEFORE touching db at all — has_data() opens
+    # its own DuckDB connection, which conflicts with a background load's
+    # read-write connection. Locking first turns that into a clean busy
+    # response, and never blocks an unrelated tenant's query.
+    if not _get_db_lock(organization_id).acquire(blocking=False):
+        return (
+            "⏳ A background download/load is currently in progress for this "
+            "tenant, so the database can't be safely queried right now. Try "
+            "again shortly, or check "
+            "check_rapid7_export_status(export_id=..., organization_id=...) for progress."
+        )
     try:
+        if not db.has_data():
+            return "Error: No data loaded. Please run start_rapid7_export and download_rapid7_export first."
         results = db.query(sql)
         result_text = json.dumps(results, indent=2, default=str)
         return f"Query executed successfully. {len(results)} rows returned.\n\n{result_text}"
     except Exception as e:
         return f"Error executing query: {str(e)}"
+    finally:
+        _get_db_lock(organization_id).release()
 
 
 @mcp.tool(
@@ -717,15 +1138,23 @@ def get_rapid7_schema(organization_id: str = "") -> str:
     """
     db = _get_db(organization_id)
 
-    if not db.has_data():
-        return "Error: No data loaded. Please run start_rapid7_export and download_rapid7_export first."
-
+    if not _get_db_lock(organization_id).acquire(blocking=False):
+        return (
+            "⏳ A background download/load is currently in progress for this "
+            "tenant, so the schema can't be safely read right now. Try again "
+            "shortly, or check "
+            "check_rapid7_export_status(export_id=..., organization_id=...) for progress."
+        )
     try:
+        if not db.has_data():
+            return "Error: No data loaded. Please run start_rapid7_export and download_rapid7_export first."
         schema = db.get_schema()
         schema_text = json.dumps(schema, indent=2)
         return f"Database schema:\n\n{schema_text}"
     except Exception as e:
         return f"Error getting schema: {str(e)}"
+    finally:
+        _get_db_lock(organization_id).release()
 
 
 @mcp.tool(
@@ -756,15 +1185,23 @@ def get_rapid7_stats(organization_id: str = "") -> str:
     """
     db = _get_db(organization_id)
 
-    if not db.has_data():
-        return "Error: No data loaded. Please run start_rapid7_export and download_rapid7_export first."
-
+    if not _get_db_lock(organization_id).acquire(blocking=False):
+        return (
+            "⏳ A background download/load is currently in progress for this "
+            "tenant, so statistics can't be safely read right now. Try again "
+            "shortly, or check "
+            "check_rapid7_export_status(export_id=..., organization_id=...) for progress."
+        )
     try:
+        if not db.has_data():
+            return "Error: No data loaded. Please run start_rapid7_export and download_rapid7_export first."
         stats = db.get_stats()
         stats_text = json.dumps(stats, indent=2, default=str)
         return f"Database statistics:\n\n{stats_text}"
     except Exception as e:
         return f"Error getting statistics: {str(e)}"
+    finally:
+        _get_db_lock(organization_id).release()
 
 
 @mcp.tool(
@@ -800,11 +1237,44 @@ def purge_rapid7_data(organization_id: str = "") -> str:
     Returns:
         Confirmation of purged data.
     """
+    # Refuse to purge while a background load holds this tenant's database —
+    # dropping the file mid-load would corrupt the in-flight load and leave
+    # stale tracker rows. Non-blocking to match the read tools, and scoped to
+    # this tenant's own lock so purging one tenant never blocks on another's
+    # in-flight load.
+    if not _get_db_lock(organization_id).acquire(blocking=False):
+        return (
+            "⏳ A background download/load is currently in progress for this "
+            "tenant, so the database can't be purged right now. Try again once "
+            "it finishes (check_rapid7_export_status(export_id=..., "
+            "organization_id=...) shows progress)."
+        )
     try:
+        # Even with the lock, a job can be between windows (downloading/polling)
+        # while the lock is momentarily free. Refuse if any durable export or
+        # job is still active for this tenant, so a purge can't delete data a
+        # worker will then repopulate under a deleted tracker row.
+        active_tracker = _tracker(organization_id)
+        try:
+            if active_tracker.has_active_work(
+                active_export_statuses=list(_ACTIVE_PHASES),
+                active_job_statuses=[JOB_RUNNING],
+            ):
+                return (
+                    "⏳ A background download/load or multi-window remediation job "
+                    "is still active for this tenant, so the database can't be "
+                    "purged right now. Wait until check_rapid7_export_status("
+                    "export_id=..., organization_id=...) reports it finished, then purge."
+                )
+        finally:
+            active_tracker.close()
+
+        # Purge main database
         db = _get_db(organization_id)
         db.purge()
 
-        tracker = ExportTracker(str(_org_data_dir(organization_id) / "rapid7_bulk_export_tracking.db"))
+        # Purge tracking database (also clears all export/phase rows)
+        tracker = _tracker(organization_id)
         tracker.purge()
 
         scope = f"organization_id={organization_id}" if organization_id else "the default (unscoped) store"
@@ -819,6 +1289,8 @@ def purge_rapid7_data(organization_id: str = "") -> str:
 
     except Exception as e:
         return f"✗ Error purging data: {str(e)}"
+    finally:
+        _get_db_lock(organization_id).release()
 
 
 @mcp.tool(
@@ -846,7 +1318,10 @@ def list_rapid7_exports(limit: int = 10, organization_id: str = "") -> str:
         Formatted list of recent exports
     """
     try:
-        tracker = ExportTracker(str(_org_data_dir(organization_id) / "rapid7_bulk_export_tracking.db"))
+        # Reads only the local tracker DB (not the shared query database), so
+        # it needs no db lock guard and is safe to call during a load — that
+        # is in fact how you watch a background load progress.
+        tracker = _tracker(organization_id)
         exports = tracker.list_exports(limit=limit, organization_id=organization_id or DEFAULT_ORG_ID)
         tracker.close()
 
@@ -860,6 +1335,8 @@ def list_rapid7_exports(limit: int = 10, organization_id: str = "") -> str:
             result += f"  Date: {exp['export_date']}\n"
             result += f"  Created: {exp['created_at']}\n"
             result += f"  Status: {exp['status']}\n"
+            if exp.get("phase_detail"):
+                result += f"  Progress: {exp['phase_detail']}\n"
             result += f"  Files: {exp['file_count']}\n"
             result += f"  Rows: {exp['row_count']}\n\n"
 
@@ -968,8 +1445,9 @@ def main():
         print("  RAPID7_PARENT_ORG_ID Your primary/parent account's own org id (required")
         print("                              only for the get_organization_ids tool; not a")
         print("                              managed tenant's id)")
-        print("  RAPID7_REGION               Your Rapid7 region: us, eu, ca, au, or ap (required)")
-        print("  DATA_DIR                    Directory for database files (default: ~/.rapid7_mcp)")
+        print("  RAPID7_REGION               Your Rapid7 region: us, us2, us3, eu, ca, au, ap (default: us)")
+        print("  DATA_DIR                    Directory for database files (takes precedence when set)")
+        print("  PLUGIN_DATA                 Plugin-host data dir; used when DATA_DIR is unset (else ~/.rapid7_mcp)")
         print("  MCP_TRANSPORT               Transport protocol: 'stdio' (default) or 'http'")
         print("  MCP_HOST                    HTTP bind address (default: 0.0.0.0)")
         print("  MCP_PORT                    HTTP port (default: 8000)")
@@ -989,8 +1467,11 @@ def main():
         print("See README.md for configuration details.")
         sys.exit(0)
 
-    # Ensure data directory exists
+    # Ensure data directory exists, including the imports/ subdir that
+    # load_rapid7_parquet reads from (its allowed root), so a fresh
+    # DATA_DIR/PLUGIN_DATA has the path users are told to copy files into.
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (_DATA_DIR / "imports").mkdir(parents=True, exist_ok=True)
 
     if _ENABLE_DAILY_SYNC:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
@@ -1010,6 +1491,31 @@ def main():
         "Rapid7 MCP server ready (multi-tenant mode: databases initialize lazily per organization_id).",
         file=sys.stderr,
     )
+
+    # Reconcile any work left mid-flight by a previous crash/restart. Background
+    # workers are daemon threads with no resume, so a stuck DOWNLOADING/LOADING
+    # export or RUNNING job would otherwise block retry forever. Covers the
+    # default/unscoped tenant plus every per-tenant tracker under
+    # DATA_DIR/orgs/ — each tenant's tracker db is a separate file, so a
+    # tenant that was mid-load at crash time must be reconciled individually
+    # or its tools would incorrectly report "already in progress" forever.
+    org_ids_to_reconcile = [""]
+    orgs_root = _DATA_DIR / "orgs"
+    if orgs_root.is_dir():
+        org_ids_to_reconcile.extend(sorted(p.name for p in orgs_root.iterdir() if p.is_dir()))
+
+    for org_id in org_ids_to_reconcile:
+        try:
+            recon_tracker = _tracker(org_id)
+            recon_tracker.reconcile_interrupted(
+                active_export_statuses=list(_ACTIVE_PHASES),
+                active_job_statuses=[JOB_RUNNING],
+                reason="Interrupted by a server restart before completing. Re-run the export/range to retry.",
+            )
+            recon_tracker.close()
+        except Exception as e:
+            label = org_id or "default"
+            print(f"Warning: could not reconcile interrupted exports for tenant {label!r}: {e}", file=sys.stderr)
 
     # Determine transport mode from environment
     transport = os.environ.get("MCP_TRANSPORT", "stdio")

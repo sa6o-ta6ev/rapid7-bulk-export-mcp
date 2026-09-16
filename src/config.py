@@ -4,6 +4,8 @@ This module handles loading and validating configuration from environment variab
 """
 
 import os
+import platform
+import subprocess  # nosec B404
 from typing import Dict, Optional
 
 USER_AGENT = "r7:bulk-export-mcp"
@@ -19,6 +21,35 @@ REGION_ENDPOINTS = {
     "au": "https://au.api.insight.rapid7.com/export/graphql",
     "ap": "https://ap.api.insight.rapid7.com/export/graphql",
 }
+
+
+def _get_key_from_keychain(service_name: str) -> Optional[str]:
+    """Retrieve a password from macOS Keychain.
+
+    Uses the `security find-generic-password` command to look up a stored
+    credential by service name. Only available on macOS.
+
+    Args:
+        service_name: The service name used when storing the credential.
+
+    Returns:
+        The password string if found, None otherwise.
+    """
+    if platform.system() != "Darwin":
+        return None
+
+    try:
+        result = subprocess.run(  # nosec B603 B607
+            ["security", "find-generic-password", "-s", service_name, "-w"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+        value = result.stdout.strip()
+        return value if value else None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
 
 
 def load_config(organization_id: Optional[str] = None) -> Dict[str, str]:
@@ -37,6 +68,12 @@ def load_config(organization_id: Optional[str] = None) -> Dict[str, str]:
             request to. When provided, selects the multi-tenant key and is
             carried through in the returned dict for callers to send as the
             R7-Organization-Id header.
+
+    On macOS, if RAPID7_API_KEY is not found in the environment (single-tenant
+    mode only — organization_id omitted), falls back to reading from the
+    macOS Keychain. Store credentials with:
+
+        security add-generic-password -s RAPID7_API_KEY -a rapid7 -w <your-key>
 
     Returns:
         dict: Configuration dictionary containing:
@@ -68,8 +105,17 @@ def load_config(organization_id: Optional[str] = None) -> Dict[str, str]:
             )
     else:
         api_key = os.environ.get("RAPID7_API_KEY")
+
+        # Fall back to macOS Keychain if not in environment
         if not api_key:
-            raise ValueError("RAPID7_API_KEY environment variable is not set")
+            api_key = _get_key_from_keychain("RAPID7_API_KEY")
+
+        if not api_key:
+            raise ValueError(
+                "RAPID7_API_KEY not found. Set the environment variable or, on macOS, "
+                "store it in Keychain: "
+                "security add-generic-password -s RAPID7_API_KEY -a rapid7 -w <your-key>"
+            )
 
     return {
         "api_key": api_key,
