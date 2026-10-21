@@ -27,6 +27,7 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from .config import load_config, load_parent_organization_config
+from .db_utils import get_db_lock
 from .download import download_all_files
 from .duckdb_loader import VulnerabilityDatabase
 from .export_manager import (
@@ -50,24 +51,19 @@ mcp = FastMCP("rapid7-bulk-export")
 # this preserves today's exact behavior and paths.
 _db_instances: Dict[str, VulnerabilityDatabase] = {}
 
-# Org-keyed locks guarding each tenant's database connection (both a
-# background load and the read tools below), so a query can never run
-# concurrently with that same tenant's tables being dropped/recreated
-# mid-load. Re-entrant so a locked section can safely call another helper
-# that also acquires it. Per-org (not global) so a background load for one
-# tenant never blocks reads/loads for an unrelated tenant — daily_sync.py
-# already relies on tenants being independent and syncs them concurrently.
-_db_locks: Dict[str, threading.RLock] = {}
-_db_locks_meta_lock = threading.Lock()
 
-
+# Locks guarding each tenant's database (both a background load and the read
+# tools below), so a query can never run concurrently with that same tenant's
+# tables being replaced mid-load. Keyed by database file via
+# db_utils.get_db_lock, the same lock the loader itself takes and the
+# in-process daily sync resolves to -- so a scheduled sync and an interactive
+# load of one tenant serialize instead of racing. Re-entrant so a locked
+# section can safely call the loader. Per-file (not global) so a background
+# load for one tenant never blocks reads/loads for an unrelated tenant.
 def _get_db_lock(organization_id: str = "") -> threading.RLock:
-    """Lazily get or create the per-tenant RLock guarding that tenant's db."""
-    key = organization_id or DEFAULT_ORG_ID
-    with _db_locks_meta_lock:
-        if key not in _db_locks:
-            _db_locks[key] = threading.RLock()
-        return _db_locks[key]
+    """Get the lock guarding this tenant's database file."""
+    return get_db_lock(_db_path(organization_id))
+
 
 # CLI positional arg override for the default org's database path, captured
 # in main() and applied lazily the first time the default db is requested.
@@ -170,7 +166,11 @@ def _daily_sync_scheduler_loop() -> None:
         logger.info("Daily sync scheduler: next run in %.0fs", sleep_seconds)
         time.sleep(sleep_seconds)
         try:
-            daily_sync.main()
+            exit_code = daily_sync.main()
+            if exit_code:
+                logger.error("Scheduled daily sync finished with errors (exit code %s)", exit_code)
+            else:
+                logger.info("Scheduled daily sync finished")
         except Exception:
             logger.exception("Scheduled daily sync run raised an unhandled exception")
 
@@ -199,15 +199,18 @@ def _org_data_dir(organization_id: Optional[str]) -> Path:
     return org_dir
 
 
+def _db_path(organization_id: str = "") -> str:
+    """Database file path for one organization."""
+    if not organization_id and _default_db_path_override:
+        return _default_db_path_override
+    return str(_org_data_dir(organization_id) / "rapid7_bulk_export.db")
+
+
 def _get_db(organization_id: str = "") -> VulnerabilityDatabase:
     """Lazily get or create the VulnerabilityDatabase for one organization."""
     key = organization_id or DEFAULT_ORG_ID
     if key not in _db_instances:
-        if key == DEFAULT_ORG_ID and _default_db_path_override:
-            resolved = _default_db_path_override
-        else:
-            resolved = str(_org_data_dir(organization_id) / "rapid7_bulk_export.db")
-        _db_instances[key] = VulnerabilityDatabase(resolved)
+        _db_instances[key] = VulnerabilityDatabase(_db_path(organization_id))
     return _db_instances[key]
 
 
@@ -300,6 +303,12 @@ def load_rapid7_parquet(parquet_path: str, organization_id: str = "") -> str:
             # Load into database
             row_counts = db.load_parquet_files_by_prefix(prefix_file_map)
             row_count = sum(row_counts.values())
+            if getattr(db, "last_load_refused_tables", []):
+                return (
+                    "✗ Some tables could not be loaded; their previously loaded data was kept unchanged.\n\n"
+                    + "\n".join(f"  {w}" for w in db.last_load_warnings)
+                    + f"\n\nRows loaded into other tables: {json.dumps(row_counts)}"
+                )
 
             # Get statistics
             stats = db.get_stats()
@@ -668,6 +677,18 @@ def _download_and_load_files(
                 row_counts = db.load_parquet_files_by_prefix(prefix_file_map)
 
             row_count = sum(row_counts.values())
+            refused = getattr(db, "last_load_refused_tables", [])
+            if refused:
+                # Existing data was kept, but this export did NOT load. Raise so the
+                # caller records FAILED rather than COMPLETE -- a COMPLETE row would
+                # make today's start_rapid7_export reuse this broken export and the
+                # nightly sync skip the type as "already synced today".
+                raise RuntimeError(
+                    f"{export_type} export did not load table(s) {', '.join(refused)}; "
+                    f"previously loaded data for them was kept unchanged. "
+                    f"Prefixes received: {list(prefix_file_map.keys())}. Details: " + "; ".join(db.last_load_warnings)
+                )
+            validation_warnings.extend(getattr(db, "last_load_warnings", []))
             if row_count == 0 and len(file_data) > 0:
                 validation_warnings.append(
                     f"⚠️  {len(file_data)} file(s) downloaded but 0 rows loaded. "
@@ -1475,9 +1496,7 @@ def main():
 
     if _ENABLE_DAILY_SYNC:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
-        logger.info(
-            "Daily sync scheduler enabled: runs at %02d:%02d UTC", _DAILY_SYNC_HOUR_UTC, _DAILY_SYNC_MINUTE_UTC
-        )
+        logger.info("Daily sync scheduler enabled: runs at %02d:%02d UTC", _DAILY_SYNC_HOUR_UTC, _DAILY_SYNC_MINUTE_UTC)
         threading.Thread(target=_daily_sync_scheduler_loop, name="daily-sync-scheduler", daemon=True).start()
 
     # Stash the CLI override for the default org's database path — applied

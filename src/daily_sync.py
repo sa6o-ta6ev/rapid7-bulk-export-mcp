@@ -108,8 +108,18 @@ def discover_tenants() -> List[Dict[str, str]]:
     account's own configured region. Filtered the same way get_organization_ids's MCP tool
     filters by default -- confirmed live that an unfiltered list includes cross-region
     duplicate entries (e.g. a "<name> - us1" org alongside the real "eu" one) that always
-    401 here, since every other call in this script is pinned to RAPID7_REGION."""
-    tenants = [{"organization_id": "", "name": DEFAULT_TENANT_NAME}]
+    401 here, since every other call in this script is pinned to RAPID7_REGION.
+
+    The default tenant is only included when RAPID7_API_KEY is configured. In a
+    multi-tenant-only deployment it has no key, so it could only ever "fail" -- and
+    its name typically duplicates a managed org's (e.g. "BaseLineIT" vs the managed
+    "BaselineIT"), which made name-based lookups ambiguous."""
+    tenants: List[Dict[str, str]] = []
+    try:
+        load_config(None)
+        tenants.append({"organization_id": "", "name": DEFAULT_TENANT_NAME})
+    except ValueError as e:
+        logger.info("Skipping default tenant %r (not configured: %s)", DEFAULT_TENANT_NAME, e)
     parent_cfg = load_parent_organization_config()
     orgs = get_managed_organizations(
         api_key=parent_cfg["api_key"],
@@ -293,8 +303,11 @@ def sync_remediation(
     for chunk_start, chunk_end in build_remediation_date_chunks(start_date, end_date):
         export_id = create_remediation_export(config, chunk_start, chunk_end)
         tracker.save_export(
-            export_id=export_id, status="PENDING", parquet_urls=[],
-            export_type="remediation", organization_id=org_key,
+            export_id=export_id,
+            status="PENDING",
+            parquet_urls=[],
+            export_type="remediation",
+            organization_id=org_key,
         )
         prefix_file_map = _download_export_files(config, organization_id, export_id)
         try:
@@ -305,12 +318,16 @@ def sync_remediation(
                 # retries this exact chunk instead of silently treating it as done.
                 raise ValueError(
                     f"remediation export {export_id} downloaded but vulnerability_remediation "
-                    f"table was never loaded (prefixes seen: {list(prefix_file_map.keys())})"
+                    f"table was never loaded (prefixes seen: {list(prefix_file_map.keys())}; "
+                    f"loader: {'; '.join(db.last_load_warnings) or 'no warnings'})"
                 )
             tracker.save_export(
-                export_id=export_id, status="COMPLETE", parquet_urls=[],
+                export_id=export_id,
+                status="COMPLETE",
+                parquet_urls=[],
                 row_count=row_counts["vulnerability_remediation"],
-                export_type="remediation", organization_id=org_key,
+                export_type="remediation",
+                organization_id=org_key,
             )
         finally:
             _cleanup_temp_files(prefix_file_map)
@@ -349,7 +366,9 @@ def sync_one_tenant(tenant: Dict[str, str]) -> Dict[str, Any]:
 
     for export_type in SNAPSHOT_EXPORT_TYPES:
         try:
-            status, prefix_file_map, export_id = sync_snapshot_export(config, tracker, org_key, organization_id, export_type)
+            status, prefix_file_map, export_id = sync_snapshot_export(
+                config, tracker, org_key, organization_id, export_type
+            )
             entry["export_types"][export_type] = status
             if export_id:
                 export_ids[export_type] = export_id
@@ -371,8 +390,12 @@ def sync_one_tenant(tenant: Dict[str, str]) -> Dict[str, Any]:
                     continue
                 if table in row_counts:
                     tracker.save_export(
-                        export_id=export_id, status="COMPLETE", parquet_urls=[],
-                        row_count=row_counts[table], export_type=export_type, organization_id=org_key,
+                        export_id=export_id,
+                        status="COMPLETE",
+                        parquet_urls=[],
+                        row_count=row_counts[table],
+                        export_type=export_type,
+                        organization_id=org_key,
                     )
                 else:
                     # Downloaded, but its table never appeared in the load's output -- e.g. an
@@ -380,9 +403,12 @@ def sync_one_tenant(tenant: Dict[str, str]) -> Dict[str, Any]:
                     # COMPLETE) so a same-day rerun retries this type instead of skipping it.
                     logger.warning(
                         "tenant=%s export_type=%s: downloaded but table '%s' was never loaded",
-                        tenant["name"], export_type, table,
+                        tenant["name"],
+                        export_type,
+                        table,
                     )
-                    entry["export_types"][export_type] = "downloaded but not loaded (prefix mismatch or empty export)"
+                    reasons = "; ".join(db.last_load_warnings) or "prefix mismatch"
+                    entry["export_types"][export_type] = f"downloaded but not loaded, existing data kept ({reasons})"
                     any_failed = True
         except Exception as e:
             logger.exception("tenant=%s: merged snapshot load failed", tenant["name"])
@@ -420,14 +446,15 @@ def write_registry_atomically(path: Path, tenants: List[Dict[str, Any]]) -> None
     os.replace(tmp_path, path)
 
 
-def main() -> int:
+def main(tenant_filter: Optional[str] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Optional: `python -m src.daily_sync <tenant name or organization_id>` to re-sync just
-    # one tenant (e.g. to backfill one that failed or was missed) instead of the whole fleet.
-    tenant_filter = sys.argv[1] if len(sys.argv) > 1 else None
-
+    # Optional tenant_filter (tenant name or organization_id) re-syncs just one tenant (e.g. to
+    # backfill one that failed or was missed) instead of the whole fleet. Taken as a parameter,
+    # NOT read from sys.argv here: the in-process scheduler shares the MCP server's argv, whose
+    # argv[1] is the default db path -- reading it here made every scheduled run filter on that
+    # path, match no tenant, and silently sync nothing (prod, 2026-09-17 onward).
     try:
         tenants = discover_tenants()
     except Exception:
@@ -437,9 +464,17 @@ def main() -> int:
     logger.info("Discovered %d tenant(s) (including default)", len(tenants))
 
     if tenant_filter:
-        matched = [
-            t for t in tenants if t["name"].lower() == tenant_filter.lower() or t["organization_id"] == tenant_filter
-        ]
+        matched = [t for t in tenants if t["organization_id"] == tenant_filter]
+        if not matched:
+            matched = [t for t in tenants if t["name"].lower() == tenant_filter.lower()]
+        if len(matched) > 1:
+            # Pick the exact-case name if that disambiguates, otherwise refuse to guess.
+            exact = [t for t in matched if t["name"] == tenant_filter]
+            if len(exact) != 1:
+                options = ", ".join(f"{t['name']} ({t['organization_id'] or 'default'})" for t in matched)
+                logger.error("Tenant %r is ambiguous: %s. Pass the organization_id instead.", tenant_filter, options)
+                return 1
+            matched = exact
         if not matched:
             available = ", ".join(t["name"] for t in tenants)
             logger.error("No tenant matching %r found. Available tenants: %s", tenant_filter, available)
@@ -455,8 +490,22 @@ def main() -> int:
             futures[executor.submit(sync_one_tenant, tenant)] = tenant
         for future in as_completed(futures):
             tenant = futures[future]
-            result = future.result()
-            logger.info("Tenant %s: status=%s export_types=%s", tenant["name"], result["status"], result.get("export_types"))
+            try:
+                result = future.result()
+            except Exception as e:
+                # sync_one_tenant handles per-export errors itself; this catches setup failures
+                # (e.g. opening its db) so one tenant can't abort the run or lose the others' registry rows.
+                logger.exception("Tenant %s: sync crashed", tenant["name"])
+                result = {
+                    "organization_id": tenant["organization_id"],
+                    "name": tenant["name"],
+                    "status": "failed",
+                    "error": str(e),
+                    "export_types": {},
+                }
+            logger.info(
+                "Tenant %s: status=%s export_types=%s", tenant["name"], result["status"], result.get("export_types")
+            )
             results.append(result)
             # Write after every tenant, not just once at the end -- a full run across many tenants
             # can take hours, and rapid7-mcp-server's Clients tab should show each tenant's data as
@@ -468,9 +517,14 @@ def main() -> int:
             write_registry_atomically(REGISTRY_PATH, results)
 
     logger.info("Registry written to %s", REGISTRY_PATH)
+    by_status: Dict[str, int] = {}
+    for r in results:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+    logger.info("Daily sync summary: %d tenant(s), %s", len(results), by_status)
 
     return 1 if any(r["status"] == "failed" for r in results) else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # `python -m src.daily_sync <tenant name or organization_id>`
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else None))

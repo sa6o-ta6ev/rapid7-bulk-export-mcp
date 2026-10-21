@@ -498,3 +498,128 @@ def test_append_returns_per_call_inserted_counts(sample_remediation_parquet_file
     # And the table really does hold 6 rows.
     assert db.query("SELECT COUNT(*) AS c FROM vulnerability_remediation")[0]["c"] == 6
     db.close()
+
+
+def _write_parquet(path, columns):
+    pq.write_table(pa.table(columns), str(path))
+    return str(path)
+
+
+def _count(db, table):
+    return db.query(f"SELECT COUNT(*) AS c FROM {table}")[0]["c"]  # nosec B608
+
+
+def test_unreadable_file_keeps_existing_snapshot(sample_parquet_file, tmp_path):
+    """Regression (prod, MON tenant): a snapshot whose files fail to read used to
+    drop the live table first and then load nothing, silently wiping the cache."""
+    db = VulnerabilityDatabase(str(tmp_path / "keep_on_bad_file.db"))
+    db.load_parquet_files_by_prefix({"asset_vulnerability": [sample_parquet_file]})
+
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"not a parquet file")
+    row_counts = db.load_parquet_files_by_prefix({"asset_vulnerability": [str(bad)]})
+
+    assert "vulnerabilities" not in row_counts
+    assert db.last_load_refused_tables == ["vulnerabilities"]
+    assert _count(db, "vulnerabilities") == 3
+
+
+def test_partially_unreadable_files_keep_existing_snapshot(sample_parquet_file, tmp_path):
+    """One bad file among good ones must not produce a half-loaded table."""
+    db = VulnerabilityDatabase(str(tmp_path / "keep_on_partial.db"))
+    db.load_parquet_files_by_prefix({"asset_vulnerability": [sample_parquet_file]})
+
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"garbage")
+    db.load_parquet_files_by_prefix({"asset_vulnerability": [sample_parquet_file, sample_parquet_file, str(bad)]})
+
+    assert db.last_load_refused_tables == ["vulnerabilities"]
+    assert _count(db, "vulnerabilities") == 3
+
+
+def test_empty_snapshot_does_not_replace_populated_table(sample_parquet_file, tmp_path):
+    db = VulnerabilityDatabase(str(tmp_path / "keep_on_empty.db"))
+    db.load_parquet_files_by_prefix({"asset_vulnerability": [sample_parquet_file]})
+
+    empty = _write_parquet(tmp_path / "empty.parquet", {"vulnId": pa.array([], pa.string())})
+    row_counts = db.load_parquet_files_by_prefix({"asset_vulnerability": [empty]})
+
+    assert "vulnerabilities" not in row_counts
+    assert db.last_load_refused_tables == ["vulnerabilities"]
+    assert "0 rows" in db.last_load_warnings[0]
+    assert _count(db, "vulnerabilities") == 3
+
+
+def test_empty_snapshot_into_fresh_db_creates_empty_table(tmp_path):
+    """Nothing to protect yet, so an empty snapshot is loaded as-is."""
+    db = VulnerabilityDatabase(str(tmp_path / "fresh_empty.db"))
+    empty = _write_parquet(tmp_path / "empty.parquet", {"vulnId": pa.array([], pa.string())})
+
+    row_counts = db.load_parquet_files_by_prefix({"asset_vulnerability": [empty]})
+
+    assert row_counts == {"vulnerabilities": 0}
+    assert db.last_load_refused_tables == []
+
+
+def test_failed_table_does_not_block_other_tables(sample_parquet_file, sample_asset_parquet_file, tmp_path):
+    db = VulnerabilityDatabase(str(tmp_path / "independent_tables.db"))
+    db.load_parquet_files_by_prefix(
+        {"asset": [sample_asset_parquet_file], "asset_vulnerability": [sample_parquet_file]}
+    )
+
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"garbage")
+    row_counts = db.load_parquet_files_by_prefix(
+        {"asset": [sample_asset_parquet_file, sample_asset_parquet_file], "asset_vulnerability": [str(bad)]}
+    )
+
+    assert row_counts == {"assets": 4}
+    assert _count(db, "assets") == 4
+    assert _count(db, "vulnerabilities") == 3
+
+
+def test_unreadable_append_file_leaves_table_untouched(sample_remediation_parquet_file, tmp_path):
+    db = VulnerabilityDatabase(str(tmp_path / "append_bad.db"))
+    prefix_map = {"vulnerability_remediation": [sample_remediation_parquet_file]}
+    db.load_parquet_files_by_prefix(prefix_map, append=True)
+
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"garbage")
+    row_counts = db.load_parquet_files_by_prefix(
+        {"vulnerability_remediation": [sample_remediation_parquet_file, str(bad)]}, append=True
+    )
+
+    assert "vulnerability_remediation" not in row_counts
+    assert _count(db, "vulnerability_remediation") == 2
+
+
+def test_agent_and_scan_policies_with_different_columns_both_load(tmp_path):
+    """Files routed to one table are matched by column name, not position."""
+    db = VulnerabilityDatabase(str(tmp_path / "policies_by_name.db"))
+    agent = _write_parquet(tmp_path / "agent.parquet", {"assetId": ["A"], "ruleId": ["R1"], "agentOnly": [1]})
+    scan = _write_parquet(tmp_path / "scan.parquet", {"ruleId": ["R2"], "assetId": ["B"]})
+
+    row_counts = db.load_parquet_files_by_prefix({"asset_policy": [agent], "asset_scan_policy": [scan]})
+
+    assert row_counts == {"policies": 2}
+    rows = db.query("SELECT assetId, ruleId, agentOnly, source FROM policies ORDER BY assetId")
+    assert rows == [
+        {"assetId": "A", "ruleId": "R1", "agentOnly": 1, "source": "agent"},
+        {"assetId": "B", "ruleId": "R2", "agentOnly": None, "source": "scan"},
+    ]
+
+
+def test_leftover_staging_tables_are_cleaned_up(sample_parquet_file, tmp_path):
+    """A crash mid-load can leave a staging table behind; the next load removes it."""
+    import duckdb
+
+    db_path = str(tmp_path / "staging_leftover.db")
+    db = VulnerabilityDatabase(db_path)
+    conn = duckdb.connect(db_path)
+    conn.execute("CREATE TABLE _staging_assets AS SELECT 1 AS x")
+    conn.close()
+
+    db.load_parquet_files_by_prefix({"asset_vulnerability": [sample_parquet_file]})
+
+    tables = {r["table_name"] for r in db.query("SELECT table_name FROM information_schema.tables")}
+    assert tables == {"vulnerabilities"}

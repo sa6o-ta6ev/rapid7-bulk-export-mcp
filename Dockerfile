@@ -27,6 +27,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 8000
 
-# Image already runs as non-root user (UID 1001)
+# Pre-create the default DATA_DIR owned by the runtime user, so a fresh named
+# volume mounted there inherits writable ownership (startup creates imports/).
+USER root
+RUN mkdir -p /data && chown 1001:0 /data && chmod 0770 /data
+# Image runs as non-root user (UID 1001)
+USER 1001
 
-ENTRYPOINT ["uv", "run", "--no-sync", "run_server.py", "/data/rapid7_bulk_export.db"]
+# No database path argument: every tenant's database, the default one included,
+# resolves under $DATA_DIR. A hardcoded path here goes stale whenever DATA_DIR
+# changes, and the in-process daily sync used to read it as a tenant filter.
+ENTRYPOINT ["uv", "run", "--no-sync", "run_server.py"]

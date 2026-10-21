@@ -3,15 +3,34 @@
 import os
 import re
 import sys
+import threading
 import time
 from contextlib import contextmanager
-from typing import Generator
+from typing import Dict, Generator
 
 import duckdb
 
 DEFAULT_MEMORY_LIMIT = "4GB"
 
 _MEMORY_LIMIT_PATTERN = re.compile(r"^\d+(\.\d+)?\s*(K|M|G|T)?i?B$", re.IGNORECASE)
+
+
+# One re-entrant lock per database file, shared by everything in this process
+# that writes it -- the interactive MCP tools and the in-process daily sync
+# both resolve to the same lock for the same file, so their loads serialize
+# instead of racing (DuckDB in-process connections to one file share an
+# instance, and concurrent DROP/CREATE/compaction would corrupt each other).
+_db_locks: Dict[str, threading.RLock] = {}
+_db_locks_meta_lock = threading.Lock()
+
+
+def get_db_lock(db_path: str) -> threading.RLock:
+    """Return the process-wide lock guarding writes to db_path."""
+    key = os.path.realpath(db_path)
+    with _db_locks_meta_lock:
+        if key not in _db_locks:
+            _db_locks[key] = threading.RLock()
+        return _db_locks[key]
 
 
 def _resolve_memory_limit() -> str:

@@ -9,7 +9,7 @@ import os
 import sys
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from .db_utils import connect_with_retry, duckdb_connection
+from .db_utils import connect_with_retry, duckdb_connection, get_db_lock
 
 KNOWN_TABLES = [
     "assets",
@@ -31,6 +31,25 @@ PREFIX_TABLE_MAP: Dict[str, Union[str, Tuple[str, str]]] = {
     "vulnerability_remediation": "vulnerability_remediation",
     "asset_software": "asset_software",
 }
+
+
+# Tables are built under this name first and only swapped in once fully loaded.
+STAGING_PREFIX = "_staging_"
+
+
+def _select_union(groups: List[Tuple[Optional[str], List[str]]]) -> str:
+    """One SELECT over every file routed to a table, matched by column name.
+
+    union_by_name tolerates files whose columns differ in order or presence
+    (e.g. agent vs scan policy files), filling gaps with NULL instead of
+    failing or misaligning positional columns.
+    """
+    parts = []
+    for source_value, paths in groups:
+        file_list = ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
+        source_col = f", '{source_value}' AS source" if source_value is not None else ""
+        parts.append(f"SELECT *{source_col} FROM read_parquet([{file_list}], union_by_name = true)")  # nosec B608
+    return " UNION ALL BY NAME ".join(parts)
 
 
 def _delete_db_files(db_path: str) -> None:
@@ -77,6 +96,10 @@ class VulnerabilityDatabase:
             db_path: Path to persistent database file. Defaults to 'rapid7_bulk_export.db'.
         """
         self.db_path = db_path or "rapid7_bulk_export.db"
+        # Reasons tables were left untouched by the most recent load (see load_parquet_files_by_prefix).
+        self.last_load_warnings: List[str] = []
+        # Tables the most recent load refused to replace/append (existing data kept).
+        self.last_load_refused_tables: List[str] = []
         if not os.path.exists(self.db_path):
             # Create the file and set permissions; connection is immediately released.
             conn = connect_with_retry(self.db_path)
@@ -111,19 +134,36 @@ class VulnerabilityDatabase:
           'asset_software'           → asset_software table
 
         Opens a short-lived read-write connection for the duration of the load,
-        then releases it so concurrent readers can proceed unblocked.
+        then releases it so concurrent readers can proceed unblocked. Holds this
+        database file's process-wide lock (db_utils.get_db_lock) throughout, so
+        the in-process daily sync and interactive MCP loads never write the same
+        file concurrently.
+
+        Every target table is first built in a staging table. Only once a
+        table's staging load fully succeeds is the live table touched, so a
+        failed or empty load can never destroy previously loaded data:
+
+          - Any file for a table fails to read → that table is left untouched.
+          - Snapshot mode, new data has 0 rows but the live table has rows →
+            left untouched (an empty snapshot of a populated tenant is
+            treated as a broken export, not as "everything was fixed").
+
+        Tables left untouched are omitted from the returned row counts, and the
+        table is listed in self.last_load_refused_tables (with the reason in
+        self.last_load_warnings), so callers can tell a refused load from a
+        real one.
 
         In snapshot mode (append=False), only the tables targeted by the incoming
-        prefixes are dropped and recreated. All other tables are preserved. This
-        allows loading vulnerability and policy exports independently without
-        one overwriting the other.
+        prefixes are replaced. All other tables are preserved. This allows
+        loading vulnerability and policy exports independently without one
+        overwriting the other.
 
         Args:
             prefix_file_map: Mapping of prefixes to lists of local Parquet file paths.
             skip_prefixes: Optional set of prefixes to skip (e.g., {'asset'} during
                 policy-only loads to avoid duplicating asset data).
-            append: When True, insert rows into existing tables rather than dropping
-                and recreating them. Use for additive loads (e.g. remediation chunks).
+            append: When True, insert rows into existing tables rather than
+                replacing them. Use for additive loads (e.g. remediation chunks).
                 Default False preserves snapshot-replace behavior.
 
         Returns:
@@ -133,106 +173,103 @@ class VulnerabilityDatabase:
         """
         if skip_prefixes is None:
             skip_prefixes = set()
+        self.last_load_warnings = []
+        self.last_load_refused_tables = []
 
-        # Accumulate row counts per table
+        # Group files by target table: {table: [(source_value, [paths])]}
+        routes: Dict[str, List[Tuple[Optional[str], List[str]]]] = {}
+        for prefix, file_paths in prefix_file_map.items():
+            if prefix in skip_prefixes:
+                continue
+            # Normalize prefix to handle sub-path suffixes (e.g., 'vulnerability_remediation/ivm')
+            normalized_prefix = _normalize_prefix(prefix)
+            if normalized_prefix in skip_prefixes:
+                continue
+            mapping = PREFIX_TABLE_MAP.get(normalized_prefix)
+            if mapping is None:
+                self._warn(f"Unknown prefix '{prefix}' ({len(file_paths)} file(s)) skipped")
+                continue
+            if not file_paths:
+                continue
+            table_name, source_value = mapping if isinstance(mapping, tuple) else (mapping, None)
+            routes.setdefault(table_name, []).append((source_value, list(file_paths)))
+
         row_counts: Dict[str, int] = {}
+        replaced: Set[str] = set()
 
-        with duckdb_connection(self.db_path) as conn:
-            # Determine which tables this load will write to, so we can drop
-            # only those in snapshot mode (preserving unrelated tables).
-            tables_to_replace: Set[str] = set()
-            if not append:
-                for prefix in prefix_file_map:
-                    if prefix in skip_prefixes:
-                        continue
-                    normalized = _normalize_prefix(prefix)
-                    if normalized in skip_prefixes:
-                        continue
-                    mapping = PREFIX_TABLE_MAP.get(normalized)
-                    if mapping is None:
-                        continue
-                    table_name = mapping[0] if isinstance(mapping, tuple) else mapping
-                    tables_to_replace.add(table_name)
+        with get_db_lock(self.db_path), duckdb_connection(self.db_path) as conn:
+            existing = {row[0] for row in conn.execute("SELECT table_name FROM information_schema.tables").fetchall()}
 
-                # Drop only the targeted tables before recreating them
-                for table_name in tables_to_replace:
-                    conn.execute(f"DROP TABLE IF EXISTS {table_name}")  # nosec B608
+            # Leftovers from a load that crashed mid-way.
+            for table_name in existing:
+                if table_name.startswith(STAGING_PREFIX):
+                    conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')  # nosec B608
 
-            # Tables we write to in this call (tracks CREATE vs INSERT decisions).
-            tables_touched: Set[str] = set()
-
-            # Pre-existing tables (after any drops above) for append-mode decisions.
-            preexisting: Set[str] = {
-                row[0] for row in conn.execute("SELECT table_name FROM information_schema.tables").fetchall()
-            }
-
-            # Row count of each pre-existing table BEFORE this call's inserts, so
-            # the returned counts are rows-inserted-this-call (a delta), not the
-            # table's cumulative total. Critical for append mode: without this,
-            # N appended windows of R rows each would report R, 2R, 3R, ...
-            counts_before: Dict[str, int] = {}
-            for table_name in preexisting:
-                result = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()  # nosec B608
-                counts_before[table_name] = result[0] if result else 0
-
-            for prefix, file_paths in prefix_file_map.items():
-                if prefix in skip_prefixes:
+            for table_name, groups in routes.items():
+                staging = f"{STAGING_PREFIX}{table_name}"
+                file_count = sum(len(paths) for _, paths in groups)
+                try:
+                    conn.execute(f"CREATE TABLE {staging} AS {_select_union(groups)}")  # nosec B608
+                except Exception as e:
+                    conn.execute(f"DROP TABLE IF EXISTS {staging}")  # nosec B608
+                    self._refuse(
+                        table_name,
+                        f"Table '{table_name}': failed to read {file_count} file(s), existing data kept unchanged: {e}",
+                    )
                     continue
 
-                # Normalize prefix to handle sub-path suffixes (e.g., 'vulnerability_remediation/ivm')
-                normalized_prefix = _normalize_prefix(prefix)
-                if normalized_prefix in skip_prefixes:
+                new_rows = conn.execute(f"SELECT COUNT(*) FROM {staging}").fetchone()[0]  # nosec B608
+                old_rows = (
+                    conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]  # nosec B608
+                    if table_name in existing
+                    else 0
+                )
+
+                if not append and new_rows == 0 and old_rows > 0:
+                    conn.execute(f"DROP TABLE {staging}")  # nosec B608
+                    self._refuse(
+                        table_name,
+                        f"Table '{table_name}': new snapshot has 0 rows from {file_count} file(s); "
+                        f"kept the existing {old_rows} rows instead of replacing them",
+                    )
                     continue
 
-                mapping = PREFIX_TABLE_MAP.get(normalized_prefix)
-                if mapping is None:
-                    print(f"Warning: Unknown prefix '{prefix}', skipping", file=sys.stderr)
+                try:
+                    conn.execute("BEGIN TRANSACTION")
+                    if append and table_name in existing:
+                        conn.execute(f"INSERT INTO {table_name} BY NAME SELECT * FROM {staging}")  # nosec B608
+                        conn.execute(f"DROP TABLE {staging}")  # nosec B608
+                    else:
+                        conn.execute(f"DROP TABLE IF EXISTS {table_name}")  # nosec B608
+                        conn.execute(f"ALTER TABLE {staging} RENAME TO {table_name}")  # nosec B608
+                        if table_name in existing:
+                            replaced.add(table_name)
+                    conn.execute("COMMIT")
+                except Exception as e:
+                    conn.execute("ROLLBACK")
+                    conn.execute(f"DROP TABLE IF EXISTS {staging}")  # nosec B608
+                    self._refuse(
+                        table_name, f"Table '{table_name}': could not apply new data, existing data kept unchanged: {e}"
+                    )
                     continue
 
-                # Determine target table and optional source value
-                if isinstance(mapping, tuple):
-                    table_name, source_value = mapping
-                else:
-                    table_name = mapping
-                    source_value = None
+                row_counts[table_name] = new_rows
 
-                for file_path in file_paths:
-                    try:
-                        if source_value is not None:
-                            select_expr = (
-                                f"SELECT *, '{source_value}' AS source"
-                                f" FROM read_parquet('{file_path}')"  # nosec B608
-                            )
-                        else:
-                            select_expr = f"SELECT * FROM read_parquet('{file_path}')"  # nosec B608
-
-                        if table_name not in tables_touched and table_name not in preexisting:
-                            # Table doesn't exist — create it
-                            conn.execute(f"CREATE TABLE {table_name} AS {select_expr}")  # nosec B608
-                        else:
-                            # Table exists (from earlier file in this call, or pre-existing in append mode)
-                            conn.execute(f"INSERT INTO {table_name} {select_expr}")  # nosec B608
-                        tables_touched.add(table_name)
-                    except Exception as e:
-                        print(
-                            f"Warning: Failed to read Parquet file '{file_path}': {e}",
-                            file=sys.stderr,
-                        )
-                        continue
-
-            # Report rows inserted BY THIS CALL: current total minus the
-            # pre-call baseline (0 for tables created in this call).
-            for table_name in tables_touched:
-                result = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()  # nosec B608
-                after = result[0] if result else 0
-                row_counts[table_name] = after - counts_before.get(table_name, 0)
-
-        # Reclaim disk space from dropped tables. DuckDB does not shrink the file
+        # Reclaim disk space from replaced tables. DuckDB does not shrink the file
         # on DROP TABLE or VACUUM — the only way is to copy to a fresh database.
-        if not append and tables_to_replace:
-            self._compact()
+        if replaced:
+            with get_db_lock(self.db_path):
+                self._compact()
 
         return row_counts
+
+    def _refuse(self, table_name: str, message: str) -> None:
+        self.last_load_refused_tables.append(table_name)
+        self._warn(message)
+
+    def _warn(self, message: str) -> None:
+        self.last_load_warnings.append(message)
+        print(f"Warning: {message}", file=sys.stderr)
 
     def _compact(self) -> None:
         """Compact the database file by copying all data to a fresh file.

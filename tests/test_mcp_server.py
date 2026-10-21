@@ -176,6 +176,28 @@ class TestDownloadRapid7ExportIsNonBlocking:
         assert "Error downloading/loading" in status_text
         assert "simulated load failure" in status_text
 
+    def test_refused_load_is_failed_not_complete(self, monkeypatch, tmp_path):
+        """If the loader kept existing data instead of loading this export, the
+        export must be FAILED: a COMPLETE row would be reused by today's
+        start_rapid7_export and make the nightly sync skip the type."""
+
+        class RefusingDB(FakeDB):
+            def load_parquet_files_by_prefix(self, *a, **kw):
+                self.last_load_refused_tables = ["vulnerabilities"]
+                self.last_load_warnings = ["Table 'vulnerabilities': new snapshot has 0 rows"]
+                return {}
+
+        _patch_common(monkeypatch, db=RefusingDB())
+
+        mcp_server.download_rapid7_export(export_id="exp-refused", export_type="vulnerability")
+        row = _wait_for_phase(tmp_path, "exp-refused", {mcp_server.PHASE_COMPLETE, mcp_server.PHASE_FAILED})
+
+        assert row["status"] == mcp_server.PHASE_FAILED
+        assert _tracker(tmp_path).get_today_export(export_type="vulnerability") is None
+        status_text = mcp_server.check_rapid7_export_status(export_id="exp-refused")
+        assert "kept unchanged" in status_text
+        assert "new snapshot has 0 rows" in status_text
+
 
 class TestCheckRapid7ExportStatusReportsLocalPhase:
     def test_unknown_export_id_falls_through_to_platform_status(self, monkeypatch):
