@@ -134,9 +134,7 @@ class TestLoadParentOrganizationConfig:
             {"RAPID7_PARENT_ORG_ID": "parent-org-abc"},
             clear=True,
         ):
-            with pytest.raises(
-                ValueError, match="RAPID7_MULTI_TENANT_API_KEY environment variable is not set"
-            ):
+            with pytest.raises(ValueError, match="RAPID7_MULTI_TENANT_API_KEY environment variable is not set"):
                 load_parent_organization_config()
 
     def test_missing_parent_organization_id_raises_error(self):

@@ -94,9 +94,7 @@ class TestGetManagedOrganizations:
 
     @responses.activate
     def test_network_error_raises_request_exception(self):
-        responses.add(
-            responses.GET, ENDPOINT, body=requests.exceptions.ConnectionError("failed")
-        )
+        responses.add(responses.GET, ENDPOINT, body=requests.exceptions.ConnectionError("failed"))
         with pytest.raises(requests.exceptions.ConnectionError):
             get_managed_organizations("key", "us", "parent-org-id")
 

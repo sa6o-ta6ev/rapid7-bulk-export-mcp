@@ -83,7 +83,11 @@ def send_graphql_request(
             response.raise_for_status()
             break
         except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code in RETRYABLE_STATUS_CODES and attempt < GRAPHQL_MAX_ATTEMPTS:
+            if (
+                e.response is not None
+                and e.response.status_code in RETRYABLE_STATUS_CODES
+                and attempt < GRAPHQL_MAX_ATTEMPTS
+            ):
                 pass
             else:
                 raise
@@ -94,7 +98,10 @@ def send_graphql_request(
         sleep_seconds = GRAPHQL_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
         logger.warning(
             "GraphQL request to %s failed (attempt %d/%d), retrying in %.0fs",
-            endpoint, attempt, GRAPHQL_MAX_ATTEMPTS, sleep_seconds,
+            endpoint,
+            attempt,
+            GRAPHQL_MAX_ATTEMPTS,
+            sleep_seconds,
         )
         time.sleep(sleep_seconds)
 

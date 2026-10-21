@@ -157,8 +157,7 @@ def load_parent_organization_config() -> Dict[str, str]:
     api_key = os.environ.get("RAPID7_MULTI_TENANT_API_KEY")
     if not api_key:
         raise ValueError(
-            "RAPID7_MULTI_TENANT_API_KEY environment variable is not set "
-            "(required to list managed organizations)"
+            "RAPID7_MULTI_TENANT_API_KEY environment variable is not set (required to list managed organizations)"
         )
 
     parent_organization_id = os.environ.get("RAPID7_PARENT_ORG_ID")

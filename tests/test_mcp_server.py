@@ -79,9 +79,15 @@ def _fake_status_complete(export_id="exp-1", file_count=2):
 
 def _patch_common(monkeypatch, status=None, file_bytes=b"x" * 200, db=None):
     status = status or _fake_status_complete()
-    monkeypatch.setattr(mcp_server, "load_config", lambda organization_id=None: {"api_key": "test-key", "endpoint": "https://example.test"})
+    monkeypatch.setattr(
+        mcp_server,
+        "load_config",
+        lambda organization_id=None: {"api_key": "test-key", "endpoint": "https://example.test"},
+    )
     monkeypatch.setattr(mcp_server, "get_export_status", lambda config, export_id: status)
-    monkeypatch.setattr(mcp_server, "download_all_files", lambda urls, api_key, organization_id=None: [file_bytes for _ in urls])
+    monkeypatch.setattr(
+        mcp_server, "download_all_files", lambda urls, api_key, organization_id=None: [file_bytes for _ in urls]
+    )
     if db is not None:
         monkeypatch.setitem(mcp_server._db_instances, mcp_server.DEFAULT_ORG_ID, db)
     return status
@@ -302,7 +308,9 @@ def _patch_remediation(monkeypatch, created_ids, load_side_effect=None, create_s
     created_ids: appended (start, end) per create so tests can assert distinct
                  IDs and date order.
     """
-    monkeypatch.setattr(mcp_server, "load_config", lambda organization_id=None: {"api_key": "k", "endpoint": "https://example.test"})
+    monkeypatch.setattr(
+        mcp_server, "load_config", lambda organization_id=None: {"api_key": "k", "endpoint": "https://example.test"}
+    )
 
     def _create(config, start, end):
         if create_side_effect is not None:
@@ -322,7 +330,9 @@ def _patch_remediation(monkeypatch, created_ids, load_side_effect=None, create_s
             "result": [{"prefix": "remediation", "urls": ["https://example.test/f.parquet"]}],
         },
     )
-    monkeypatch.setattr(mcp_server, "download_all_files", lambda urls, api_key, organization_id=None: [b"x" * 200 for _ in urls])
+    monkeypatch.setattr(
+        mcp_server, "download_all_files", lambda urls, api_key, organization_id=None: [b"x" * 200 for _ in urls]
+    )
 
 
 def _wait_for_job(tmp_path, job_id, target, timeout=5.0):
@@ -567,14 +577,18 @@ class TestRemediationRangeIdempotency:
         return start, end
 
     def test_running_job_for_same_range_is_reused(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(mcp_server, "load_config", lambda organization_id=None: {"api_key": "k", "endpoint": "https://x"})
+        monkeypatch.setattr(
+            mcp_server, "load_config", lambda organization_id=None: {"api_key": "k", "endpoint": "https://x"}
+        )
         start, end = self._seed_job(tmp_path, mcp_server.JOB_RUNNING)
         result = mcp_server.start_rapid7_export(export_type="remediation", start_date=start, end_date=end)
         assert "already in progress" in result
         assert "remediation-seed-RUNNING" in result
 
     def test_complete_job_for_same_range_returns_stored_result_not_rerun(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(mcp_server, "load_config", lambda organization_id=None: {"api_key": "k", "endpoint": "https://x"})
+        monkeypatch.setattr(
+            mcp_server, "load_config", lambda organization_id=None: {"api_key": "k", "endpoint": "https://x"}
+        )
         # If the guard failed and it tried to start a job, this would raise.
         monkeypatch.setattr(
             mcp_server,
@@ -587,7 +601,9 @@ class TestRemediationRangeIdempotency:
         assert "remediation-seed-COMPLETE" in result
 
     def test_failed_job_for_same_range_starts_fresh(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(mcp_server, "load_config", lambda organization_id=None: {"api_key": "k", "endpoint": "https://x"})
+        monkeypatch.setattr(
+            mcp_server, "load_config", lambda organization_id=None: {"api_key": "k", "endpoint": "https://x"}
+        )
         started = {"called": False}
         monkeypatch.setattr(
             mcp_server, "_start_remediation_job", lambda s, e, org="": started.update(called=True) or "remediation-new"
