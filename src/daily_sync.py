@@ -179,7 +179,9 @@ def _download_export_files(
         for url in item.get("urls", []):
             url_to_prefix[url] = prefix
 
-    file_data = download_all_files(parquet_urls, config["api_key"], organization_id=organization_id)
+    file_data = download_all_files(
+        parquet_urls, config["api_key"], organization_id=config.get("organization_id", organization_id) or None
+    )
 
     temp_dir = tempfile.mkdtemp(prefix="daily_sync_")
     prefix_file_map: Dict[str, List[str]] = {}

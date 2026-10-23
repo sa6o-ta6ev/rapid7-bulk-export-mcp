@@ -632,6 +632,7 @@ def _download_and_load_files(
     api_key: str,
     organization_id: str = "",
     on_downloaded=None,
+    request_organization_id: Optional[str] = None,
 ) -> tuple:
     """Download an export's parquet files and load them into DuckDB.
 
@@ -641,9 +642,16 @@ def _download_and_load_files(
     is called once the files are actually downloaded and before the load
     begins, so a caller can record the LOADING phase honestly. Returns
     (row_count, row_counts, stats, validation_warnings).
+
+    organization_id selects the tenant's db; request_organization_id is the
+    R7-Organization-Id header to send (load_config's "organization_id",
+    which is "" for a per-org key from RAPID7_ORG_API_KEYS). Defaults to
+    organization_id.
     """
+    if request_organization_id is None:
+        request_organization_id = organization_id
     parquet_urls = status_info["parquetFiles"]
-    file_data = download_all_files(parquet_urls, api_key, organization_id=organization_id or None)
+    file_data = download_all_files(parquet_urls, api_key, organization_id=request_organization_id or None)
     if on_downloaded is not None:
         on_downloaded()
 
@@ -735,7 +743,12 @@ def _run_download_and_load(export_id: str, export_type: str, organization_id: st
             )
 
         row_count, row_counts, stats, validation_warnings = _download_and_load_files(
-            export_type, status_info, config["api_key"], organization_id=organization_id, on_downloaded=_mark_loading
+            export_type,
+            status_info,
+            config["api_key"],
+            organization_id=organization_id,
+            on_downloaded=_mark_loading,
+            request_organization_id=config.get("organization_id", organization_id),
         )
         row_info = f"Rows loaded: {row_count}\nPer-table row counts: {json.dumps(row_counts, default=str)}"
 
@@ -845,6 +858,7 @@ def _run_remediation_job(job_id: str, chunks: list, organization_id: str = "") -
                 config["api_key"],
                 organization_id=organization_id,
                 on_downloaded=lambda: _mark("loading"),
+                request_organization_id=config.get("organization_id", organization_id),
             )
             # Mark loaded the instant the append has committed, BEFORE any
             # further tracker writes. If save_export below throws, the window

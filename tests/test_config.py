@@ -83,6 +83,60 @@ class TestLoadConfig:
             assert len(config) == 4  # Ensure no extra keys
 
 
+class TestOrgApiKeyOverride:
+    """Tests for per-organization keys from RAPID7_ORG_API_KEYS."""
+
+    BASE_ENV = {"RAPID7_MULTI_TENANT_API_KEY": "mt-key", "RAPID7_REGION": "eu"}
+
+    def test_org_key_replaces_multi_tenant_key_and_drops_header_org(self):
+        env = {**self.BASE_ENV, "RAPID7_ORG_API_KEYS": '{"org-a": "org-a-key"}'}
+        with patch.dict(os.environ, env, clear=True):
+            config = load_config("org-a")
+
+            assert config["api_key"] == "org-a-key"
+            assert config["organization_id"] == ""
+            assert len(config) == 4
+
+    def test_unlisted_org_uses_multi_tenant_key(self):
+        env = {**self.BASE_ENV, "RAPID7_ORG_API_KEYS": '{"org-a": "org-a-key"}'}
+        with patch.dict(os.environ, env, clear=True):
+            config = load_config("org-b")
+
+            assert config["api_key"] == "mt-key"
+            assert config["organization_id"] == "org-b"
+
+    def test_org_key_needs_no_multi_tenant_key(self):
+        env = {"RAPID7_REGION": "eu", "RAPID7_ORG_API_KEYS": '{"org-a": "org-a-key"}'}
+        with patch.dict(os.environ, env, clear=True):
+            assert load_config("org-a")["api_key"] == "org-a-key"
+
+    def test_empty_org_key_falls_back_to_multi_tenant_key(self):
+        env = {**self.BASE_ENV, "RAPID7_ORG_API_KEYS": '{"org-a": ""}'}
+        with patch.dict(os.environ, env, clear=True):
+            config = load_config("org-a")
+
+            assert config["api_key"] == "mt-key"
+            assert config["organization_id"] == "org-a"
+
+    def test_default_tenant_ignores_org_keys(self):
+        env = {"RAPID7_API_KEY": "single-key", "RAPID7_REGION": "eu", "RAPID7_ORG_API_KEYS": '{"": "nope"}'}
+        with patch.dict(os.environ, env, clear=True):
+            assert load_config()["api_key"] == "single-key"
+
+    def test_invalid_json_raises_without_echoing_value(self):
+        env = {**self.BASE_ENV, "RAPID7_ORG_API_KEYS": '{"org-a": "secret-value"'}
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(ValueError, match="not valid JSON") as exc:
+                load_config("org-a")
+            assert "secret-value" not in str(exc.value)
+
+    def test_non_object_json_raises(self):
+        env = {**self.BASE_ENV, "RAPID7_ORG_API_KEYS": '["org-a", "org-a-key"]'}
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(ValueError, match="must be a JSON object"):
+                load_config("org-a")
+
+
 class TestLoadParentOrganizationConfig:
     """Tests for the load_parent_organization_config() function."""
 

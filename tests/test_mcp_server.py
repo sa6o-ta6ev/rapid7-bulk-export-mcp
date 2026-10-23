@@ -450,12 +450,17 @@ class TestMultiChunkRemediation:
         real_loader = mcp_server._download_and_load_files
         calls = {"n": 0}
 
-        def _flaky(export_type, status_info, api_key, organization_id="", on_downloaded=None):
+        def _flaky(export_type, status_info, api_key, organization_id="", on_downloaded=None, **kwargs):
             calls["n"] += 1
             if calls["n"] == 3:
                 raise RuntimeError("simulated load failure on chunk 3")
             return real_loader(
-                export_type, status_info, api_key, organization_id=organization_id, on_downloaded=on_downloaded
+                export_type,
+                status_info,
+                api_key,
+                organization_id=organization_id,
+                on_downloaded=on_downloaded,
+                **kwargs,
             )
 
         monkeypatch.setattr(mcp_server, "_download_and_load_files", _flaky)

@@ -578,6 +578,16 @@ This also means the same-day export-reuse check (`start_rapid7_export` won't rec
 5. Also set `RAPID7_PARENT_ORG_ID` to your **primary** account's own organization id (from the Rapid7 UI, or your account team) — this is required only by the `get_organization_ids` tool, and is distinct from any managed tenant's id.
 6. Call the `get_organization_ids` tool to list every managed organization's name, id, and region live — this is the recommended way to discover `organization_id` values for the tools above, and replaces any manual UI lookup or local tenant-list file.
 
+### Per-organization API keys
+
+Some managed tenants can return exports that report `SUCCEEDED` but contain only empty (schema-only) Parquet files when read with the multi-tenant key, while an Organization API key created inside that tenant returns the full data. For those tenants, set `RAPID7_ORG_API_KEYS` to a JSON object mapping the organization id to that tenant's own key:
+
+```bash
+RAPID7_ORG_API_KEYS='{"00000000-0000-0000-0000-000000000000": "<organization api key>"}'
+```
+
+A listed organization uses its own key for every export, status and download call, sent **without** the `R7-Organization-Id` header (as Rapid7 requires for Organization keys). Its data is still stored under `DATA_DIR/orgs/<organization_id>/`, and every other tenant keeps using `RAPID7_MULTI_TENANT_API_KEY`. Tenant discovery (`get_organization_ids` and the daily sync's tenant list) always uses the multi-tenant key.
+
 ### Example usage
 
 ```
@@ -673,6 +683,7 @@ uv run pytest
 |----------|----------|---------|-------------|
 | `RAPID7_API_KEY` | Yes | — | Rapid7 InsightVM API key |
 | `RAPID7_MULTI_TENANT_API_KEY` | No | — | Rapid7 Multi-Tenant Admin/User API key. Only required if you pass `organization_id` to a tool call, or call `get_organization_ids` — see [Multi-Tenant Support](#multi-tenant-support) |
+| `RAPID7_ORG_API_KEYS` | No | — | JSON object of `{"<organization_id>": "<api key>"}`. A listed organization uses its own Organization API key (without `R7-Organization-Id`) instead of the multi-tenant key — see [Per-organization API keys](#per-organization-api-keys) |
 | `RAPID7_PARENT_ORG_ID` | No | — | Your primary/parent account's own organization id (not a managed tenant's id). Only required for the `get_organization_ids` tool — see [Multi-Tenant Support](#multi-tenant-support) |
 | `RAPID7_REGION` | Yes | `us` | API region: `us`, `us2`, `us3`, `eu`, `ca`, `au`, `ap` |
 | `DATA_DIR` | No | `~/.rapid7_mcp` | Directory for database files; must be writable. Manual parquet imports must be placed in `$DATA_DIR/imports/` |

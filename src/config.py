@@ -3,6 +3,7 @@
 This module handles loading and validating configuration from environment variables.
 """
 
+import json
 import os
 import platform
 import subprocess  # nosec B404
@@ -52,6 +53,31 @@ def _get_key_from_keychain(service_name: str) -> Optional[str]:
         return None
 
 
+def _get_org_api_key(organization_id: str) -> Optional[str]:
+    """Look up a per-organization API key override in RAPID7_ORG_API_KEYS.
+
+    RAPID7_ORG_API_KEYS is a JSON object mapping organization ids to an
+    Organization API key created in that organization, e.g.
+    '{"<organization_id>": "<key>"}'. Used for managed tenants whose data the
+    multi-tenant key cannot read (Rapid7 then returns SUCCEEDED exports with
+    0-row files rather than an authorization error).
+
+    Raises:
+        ValueError: If RAPID7_ORG_API_KEYS is set but is not a JSON object of
+            string keys to string values. The value itself is never echoed.
+    """
+    raw = os.environ.get("RAPID7_ORG_API_KEYS", "").strip()
+    if not raw:
+        return None
+    try:
+        keys = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"RAPID7_ORG_API_KEYS is not valid JSON (line {e.lineno}, column {e.colno})") from None
+    if not isinstance(keys, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in keys.items()):
+        raise ValueError('RAPID7_ORG_API_KEYS must be a JSON object of {"<organization_id>": "<api key>"}')
+    return keys.get(organization_id) or None
+
+
 def load_config(organization_id: Optional[str] = None) -> Dict[str, str]:
     """Load and validate configuration from environment variables.
 
@@ -62,6 +88,11 @@ def load_config(organization_id: Optional[str] = None) -> Dict[str, str]:
     - organization_id provided: RAPID7_MULTI_TENANT_API_KEY (a Rapid7
       Multi-Tenant Admin/User key, which requires the R7-Organization-Id
       header on every request and has no default-org fallback of its own).
+    - organization_id provided and listed in RAPID7_ORG_API_KEYS: that
+      organization's own key instead, sent without R7-Organization-Id
+      (the returned organization_id is ""). Data still lives under the
+      tenant's own DATA_DIR/orgs/<organization_id>/ -- callers key storage
+      off their own organization_id, not this dict's.
 
     Args:
         organization_id: Optional Rapid7 customer/tenant org ID to scope this
@@ -96,7 +127,13 @@ def load_config(organization_id: Optional[str] = None) -> Dict[str, str]:
 
     endpoint = REGION_ENDPOINTS[region]
 
-    if organization_id:
+    org_api_key = _get_org_api_key(organization_id) if organization_id else None
+
+    if org_api_key:
+        # An Organization key is already bound to its org: Rapid7 expects it
+        # without R7-Organization-Id, so the header org is left empty.
+        api_key = org_api_key
+    elif organization_id:
         api_key = os.environ.get("RAPID7_MULTI_TENANT_API_KEY")
         if not api_key:
             raise ValueError(
@@ -121,7 +158,7 @@ def load_config(organization_id: Optional[str] = None) -> Dict[str, str]:
         "api_key": api_key,
         "region": region,
         "endpoint": endpoint,
-        "organization_id": organization_id or "",
+        "organization_id": "" if org_api_key else (organization_id or ""),
     }
 
 
